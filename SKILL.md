@@ -1,5 +1,5 @@
 ---
-name: gemini-image-gen
+name: nanobanana-skill
 description: |
   Gemini 웹에서 이미지를 생성하고 로컬에 저장합니다.
   "gemini로 이미지 생성", "Imagen", "gemini image gen", "이미지 만들어줘 gemini" 등의 요청 시 사용.
@@ -44,7 +44,7 @@ pip install playwright && python3 -m playwright install chromium
 ## Step 1 — Chrome 실행
 
 ```bash
-bash ~/.claude/skills/gemini-image-gen/launch_chrome.sh
+bash ~/.claude/skills/nanobanana-skill/launch_chrome.sh
 ```
 
 출력에서 `READY port=9222` 또는 `ALREADY_RUNNING port=9222` 확인.
@@ -71,7 +71,7 @@ B인 경우: `lsof -i :9222` 실행 후 포트 상태를 확인하고 안내.
 ## Step 3 — 이미지 생성
 
 ```bash
-SKILL_DIR=~/.claude/skills/gemini-image-gen
+SKILL_DIR=~/.claude/skills/nanobanana-skill
 
 python3 "$SKILL_DIR/generate.py" \
   "{PROMPT}" \

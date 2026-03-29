@@ -76,7 +76,7 @@ ERROR_PATTERNS = [
 def make_output_path(out_dir: str, index: int, ext: str = "png") -> Path:
     out = Path(out_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
-    ts = int(time.time())
+    ts = int(time.time() * 1000)
     return out / f"gemini_{ts}_{index:02d}.{ext}"
 
 
@@ -146,11 +146,14 @@ async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> boo
             return False
         elif src.startswith("data:image/"):
             # data URL: "data:image/png;base64,xxxxx"
-            header, encoded = src.split(",", 1)
+            parts = src.split(",", 1)
+            if len(parts) != 2:
+                return False
+            header, encoded = parts
             ext_match = re.search(r"image/(\w+)", header)
             ext = ext_match.group(1) if ext_match else "png"
             path = path.with_suffix(f".{ext}")
-            path.write_bytes(base64.b64decode(encoded))
+            path.write_bytes(base64.b64decode(encoded + "=="))  # padding 허용
             return True
         elif src.startswith("http"):
             # CDN URL: Playwright로 직접 fetch
@@ -237,7 +240,7 @@ async def wait_for_images(page, timeout_ms: int) -> list[str]:
                 return last_srcs
         else:
             stable_count = 0
-            last_srcs = []
+            # DOM 깜빡임으로 일시적으로 비어도 기존 목록 유지
 
         await asyncio.sleep(IMAGE_WAIT_POLL / 1000)
 
@@ -257,100 +260,101 @@ async def screenshot_fallback(page, out_dir: str, count: int) -> list[Path]:
 
 
 async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str]:
-    """메인 이미지 생성 함수. 저장된 파일 경로 목록을 반환."""
+    """메인 이미지 생성 함수. 저장된 파일 경로 목록을 반환.
+    실패 시 RuntimeError를 raise합니다 (sys.exit 대신)."""
 
     async with async_playwright() as pw:
         # CDP 모드로 기존 Chrome에 attach
         try:
             browser = await pw.chromium.connect_over_cdp(f"http://localhost:{port}")
         except Exception as e:
-            print(f"ERROR: Chrome CDP 연결 실패 (port {port}): {e}", file=sys.stderr)
-            print("launch_chrome.sh를 먼저 실행하고 로그인을 완료하세요.", file=sys.stderr)
-            sys.exit(1)
+            raise RuntimeError(
+                f"Chrome CDP 연결 실패 (port {port}): {e}\n"
+                "launch_chrome.sh를 먼저 실행하고 로그인을 완료하세요."
+            )
 
-        # 기존 컨텍스트/탭 사용
-        contexts = browser.contexts
-        if not contexts:
-            print("ERROR: Chrome에 열린 탭이 없습니다.", file=sys.stderr)
-            sys.exit(1)
-
-        ctx = contexts[0]
-        pages = ctx.pages
-        page = None
-
-        # Gemini 탭 찾기
-        for p in pages:
-            if "gemini.google.com" in p.url:
-                page = p
-                break
-
-        # Gemini 탭 없으면 새 탭
-        if page is None:
-            page = await ctx.new_page()
-
-        # Gemini 앱 페이지인지 확인
-        if "gemini.google.com/app" not in page.url:
-            await page.goto(GEMINI_URL, wait_until="networkidle")
-
-        # 로그인 상태 확인 (로그인 필요 시 중단)
-        if "accounts.google.com" in page.url or "signin" in page.url.lower():
-            print("ERROR: 로그인이 필요합니다. Chrome에서 Gemini에 로그인 후 재실행하세요.", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"[✓] Gemini 페이지 확인: {page.url}")
-
-        # 입력창 찾기
-        inp = await find_input(page)
-        if inp is None:
-            print("ERROR: 텍스트 입력창을 찾을 수 없습니다.", file=sys.stderr)
-            print("Gemini 페이지가 완전히 로드됐는지 확인하세요.", file=sys.stderr)
-            sys.exit(1)
-
-        # 이전 대화 내용으로 인한 오염 방지 — 새 대화 시작 시도
         try:
-            new_chat_btn = page.locator("a[href='/app'], button[aria-label*='New chat'], button[aria-label*='새 대화']").first
-            if await new_chat_btn.is_visible(timeout=2000):
-                await new_chat_btn.click()
-                await page.wait_for_load_state("networkidle", timeout=5000)
-                inp = await find_input(page)
-        except Exception:
-            pass
+            # 기존 컨텍스트/탭 사용
+            contexts = browser.contexts
+            if not contexts:
+                raise RuntimeError("Chrome에 열린 탭이 없습니다.")
 
-        # 프롬프트 입력
-        print(f"[→] 프롬프트 전송: {prompt!r}")
-        await inp.click()
-        await inp.fill("")
-        await page.keyboard.type(prompt, delay=20)
-        await page.keyboard.press("Enter")
+            ctx = contexts[0]
+            pages = ctx.pages
+            page = None
 
-        # 이미지 생성 대기
-        print(f"[…] 이미지 생성 대기 중 (최대 {DEFAULT_TIMEOUT//1000}초)")
-        srcs = await wait_for_images(page, DEFAULT_TIMEOUT)
+            # Gemini 탭 찾기
+            for p in pages:
+                if "gemini.google.com" in p.url:
+                    page = p
+                    break
 
-        saved_paths = []
+            # Gemini 탭 없으면 새 탭
+            if page is None:
+                page = await ctx.new_page()
 
-        if srcs:
-            print(f"[✓] 이미지 {len(srcs)}개 발견")
-            for i, src in enumerate(srcs[:count]):
-                ext = "png"
-                if "jpeg" in src or "jpg" in src:
-                    ext = "jpg"
-                elif "webp" in src:
-                    ext = "webp"
-                out_path = make_output_path(out_dir, i, ext)
-                ok = await save_image_from_src(page, src, out_path, index=i)
-                if ok:
-                    print(f"[✓] 저장 완료: {out_path}")
-                    saved_paths.append(str(out_path))
-                else:
-                    print(f"[!] 저장 실패 (src={src[:60]}...)", file=sys.stderr)
-        else:
-            print("[!] 이미지를 찾지 못했습니다. 스크린샷 fallback 실행...", file=sys.stderr)
-            fb = await screenshot_fallback(page, out_dir, 1)
-            saved_paths = [str(p) for p in fb]
+            # Gemini 앱 페이지인지 확인
+            if "gemini.google.com/app" not in page.url:
+                await page.goto(GEMINI_URL, wait_until="networkidle")
 
-        await browser.close()
-        return saved_paths
+            # 로그인 상태 확인
+            if "accounts.google.com" in page.url or "signin" in page.url.lower():
+                raise RuntimeError("로그인이 필요합니다. Chrome에서 Gemini에 로그인 후 재실행하세요.")
+
+            print(f"[✓] Gemini 페이지 확인: {page.url}")
+
+            # 입력창 찾기
+            inp = await find_input(page)
+            if inp is None:
+                raise RuntimeError("텍스트 입력창을 찾을 수 없습니다. Gemini 페이지가 완전히 로드됐는지 확인하세요.")
+
+            # 이전 대화 내용으로 인한 오염 방지 — 새 대화 시작 시도
+            try:
+                new_chat_btn = page.locator("a[href='/app'], button[aria-label*='New chat'], button[aria-label*='새 대화']").first
+                if await new_chat_btn.is_visible(timeout=2000):
+                    await new_chat_btn.click()
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                    inp = await find_input(page)
+            except Exception:
+                pass
+
+            # 프롬프트 입력 (fill로 직접 삽입 — keyboard.type 개행 주입 방지)
+            print(f"[→] 프롬프트 전송: {prompt!r}")
+            await inp.click()
+            await inp.fill(prompt)
+            await page.keyboard.press("Enter")
+
+            # 이미지 생성 대기
+            print(f"[…] 이미지 생성 대기 중 (최대 {DEFAULT_TIMEOUT//1000}초)")
+            srcs = await wait_for_images(page, DEFAULT_TIMEOUT)
+
+            saved_paths = []
+
+            if srcs:
+                print(f"[✓] 이미지 {len(srcs)}개 발견")
+                for i, src in enumerate(srcs[:count]):
+                    ext = "png"
+                    if "jpeg" in src or "jpg" in src:
+                        ext = "jpg"
+                    elif "webp" in src:
+                        ext = "webp"
+                    out_path = make_output_path(out_dir, i, ext)
+                    ok = await save_image_from_src(page, src, out_path, index=i)
+                    if ok:
+                        print(f"[✓] 저장 완료: {out_path}")
+                        saved_paths.append(str(out_path))
+                    else:
+                        print(f"[!] 저장 실패 (src={src[:60]}...)", file=sys.stderr)
+            else:
+                print("[!] 이미지를 찾지 못했습니다. 스크린샷 fallback 실행...", file=sys.stderr)
+                fb = await screenshot_fallback(page, out_dir, 1)
+                saved_paths = [str(p) for p in fb]
+
+            return saved_paths
+
+        finally:
+            # CDP attach한 브라우저는 disconnect (close하면 Chrome이 종료됨)
+            await browser.disconnect()
 
 
 # ─── CLI 진입점 ──────────────────────────────────────────────────────────────
@@ -369,7 +373,11 @@ def main():
         print(f"ERROR: --count는 1~{MAX_IMAGES} 사이여야 합니다.", file=sys.stderr)
         sys.exit(1)
 
-    paths = asyncio.run(generate(args.prompt, args.out, args.count, args.port))
+    try:
+        paths = asyncio.run(generate(args.prompt, args.out, args.count, args.port))
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if paths:
         print("\n=== 생성 완료 ===")
