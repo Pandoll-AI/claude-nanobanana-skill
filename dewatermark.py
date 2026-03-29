@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Gemini 이미지 워터마크 제거 — 하이브리드: Reverse Alpha + OpenCV Inpainting.
-저-alpha 경계: reverse alpha blending (수학적으로 정확)
-고-alpha 중심: OpenCV NS inpainting (텍스처 기반 복원)
+Gemini 이미지 워터마크 제거 — 2-pass 하이브리드.
+Pass 1: Reverse alpha blending (모든 valid 픽셀)
+Pass 2: Clipping 아티팩트만 OpenCV inpainting으로 수정
 """
 
 import sys, time
@@ -13,7 +13,6 @@ from PIL import Image
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 ALPHA_THRESHOLD = 0.002
-INPAINT_ALPHA_THRESHOLD = 0.25  # 이 이상은 inpainting으로 처리
 LOGO_VALUE = 255.0
 
 _ALPHA_MAPS: dict[str, np.ndarray] = {}
@@ -64,60 +63,60 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
     alpha_3d = alpha_2d[:, :, np.newaxis]
     valid = alpha_2d > ALPHA_THRESHOLD
 
-    # --- Phase 1: OpenCV Inpainting으로 고-alpha 영역 복원 ---
-    # inpainting mask: alpha > threshold인 영역
-    inpaint_mask = (alpha_2d > INPAINT_ALPHA_THRESHOLD).astype(np.uint8) * 255
-
-    # 확장 영역에서 inpainting (경계 참조를 위해 padding)
-    pad = 8
-    ey1, ey2 = max(0, y-pad), min(height, y+ls+pad)
-    ex1, ex2 = max(0, x-pad), min(width, x+ls+pad)
-    oy, ox = y - ey1, x - ex1
-
-    # 확장 영역 BGR (OpenCV 형식)
-    expanded_bgr = cv2.cvtColor(
-        img_array[ey1:ey2, ex1:ex2, :].astype(np.uint8),
-        cv2.COLOR_RGB2BGR
-    )
-
-    # 확장 영역 크기의 마스크 (padding 영역은 0)
-    expanded_mask = np.zeros(expanded_bgr.shape[:2], dtype=np.uint8)
-    expanded_mask[oy:oy+ls, ox:ox+ls] = inpaint_mask
-
-    # NS inpainting (radius=3 for tighter fill)
-    inpainted_bgr = cv2.inpaint(expanded_bgr, expanded_mask, 3, cv2.INPAINT_NS)
-    inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
-    inpainted_roi = inpainted_rgb[oy:oy+ls, ox:ox+ls, :]
-
-    # --- Phase 2: Reverse Alpha로 저-alpha 경계 복원 ---
+    # --- Pass 1: Reverse Alpha Blending (모든 valid 픽셀) ---
     alpha_clamped = np.clip(alpha_3d, 0, 0.99)
     raw_restored = (roi - alpha_clamped * LOGO_VALUE) / (1.0 - alpha_clamped)
+
+    # Clipping이 필요한 픽셀 감지 (= reverse alpha가 실패한 영역)
+    needs_fix = ((raw_restored < -5).any(axis=2) | (raw_restored > 260).any(axis=2)) & valid
+
     restored = np.clip(raw_restored, 0, 255)
 
-    # --- Phase 3: 블렌딩 ---
-    # 저-alpha: reverse alpha 사용 (정확)
-    # 고-alpha: inpainting 사용 (텍스처 기반)
-    # 중간: 부드러운 전환
-    # blend_weight: 0 = reverse alpha, 1 = inpainting
-    # alpha < 0.08: 100% reverse alpha
-    # alpha > 0.30: 100% inpainting
-    # 사이: 선형 보간
-    blend_weight = np.clip((alpha_2d - 0.08) / 0.22, 0, 1)[:, :, np.newaxis]
-
-    blended = restored * (1.0 - blend_weight) + inpainted_roi * blend_weight
-
-    # valid 영역만 적용
+    # Pass 1 결과를 이미지에 적용
     valid_3d = valid[:, :, np.newaxis]
-    img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, blended, roi)
+    img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, restored, roi)
+
+    # --- Pass 2: Clipping 아티팩트만 inpainting으로 수정 ---
+    n_fix = int(np.sum(needs_fix))
+    if n_fix > 0:
+        # needs_fix 영역만 마스크로 inpainting
+        fix_mask = needs_fix.astype(np.uint8) * 255
+
+        # dilate로 마스크 약간 확장 (아티팩트 주변도 포함)
+        kernel = np.ones((3, 3), np.uint8)
+        fix_mask = cv2.dilate(fix_mask, kernel, iterations=1)
+
+        # 확장 영역에서 inpainting
+        pad = 6
+        ey1, ey2 = max(0, y-pad), min(height, y+ls+pad)
+        ex1, ex2 = max(0, x-pad), min(width, x+ls+pad)
+        oy, ox = y - ey1, x - ex1
+
+        expanded_bgr = cv2.cvtColor(
+            img_array[ey1:ey2, ex1:ex2, :].astype(np.uint8),
+            cv2.COLOR_RGB2BGR
+        )
+
+        expanded_mask = np.zeros(expanded_bgr.shape[:2], dtype=np.uint8)
+        expanded_mask[oy:oy+ls, ox:ox+ls] = fix_mask
+
+        inpainted_bgr = cv2.inpaint(expanded_bgr, expanded_mask, 3, cv2.INPAINT_TELEA)
+        inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+
+        # inpainting 결과를 원본에 적용 (마스크 영역만)
+        img_array[ey1:ey2, ex1:ex2, :] = np.where(
+            expanded_mask[:, :, np.newaxis] > 0,
+            inpainted_rgb,
+            img_array[ey1:ey2, ex1:ex2, :]
+        )
 
     Image.fromarray(img_array.astype(np.uint8), "RGB").save(str(output_path))
 
-    n_inpaint = int(np.sum(alpha_2d > INPAINT_ALPHA_THRESHOLD))
     return {
         "success": True,
         "elapsed_ms": round((time.time() - t0) * 1000, 1),
         "pixels_modified": int(np.sum(valid)),
-        "pixels_inpainted": n_inpaint,
+        "pixels_inpainted": n_fix,
         "logo_size": ls,
         "position": (x, y),
         "alpha_src": src_name,
@@ -135,11 +134,11 @@ def main():
             if "_clean" in img.stem or "_exp" in img.stem: continue
             out = img.parent / f"{img.stem}_clean{img.suffix}"
             r = remove_watermark(img, out)
-            print(f"  {'✓' if r['success'] else '✗'} {img.name} ({r.get('elapsed_ms',0):.0f}ms)")
+            print(f"  {'✓' if r['success'] else '✗'} {img.name} ({r.get('elapsed_ms',0):.0f}ms, fix={r.get('pixels_inpainted',0)})")
     elif args.image:
         r = remove_watermark(args.image, args.output)
         if r["success"]:
-            print(f"완료: {args.output or args.image} ({r['pixels_modified']}px, {r['elapsed_ms']:.0f}ms)")
+            print(f"완료: {args.output or args.image} ({r['pixels_modified']}px, fix={r['pixels_inpainted']}px, {r['elapsed_ms']:.0f}ms)")
         else:
             print(f"ERROR: {r['error']}", file=sys.stderr); sys.exit(1)
     else:
