@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3] - 2026-03-29
+
+### Fixed
+- SKILL.md에 "Node.js/TypeScript 프로젝트" 명시 — 다른 AI가 Python으로 실행하는 혼동 방지
+- playwright 에러 메시지에 "pip이 아니라 npm" 경고 추가
+- 에러 처리 테이블에 playwright 미설치 항목 추가
+
 ## [0.2.2] - 2026-03-29
 
 ### Fixed (Critical)

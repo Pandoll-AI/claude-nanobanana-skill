@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 /**
- * Gemini Web Image Generator (nanobanana-skill v0.2.2)
+ * Gemini Web Image Generator (nanobanana-skill v0.2.3)
  * CDP 모드 Chrome에 attach해서 gemini.google.com에서 이미지를 자동 생성·저장합니다.
  *
  * Usage:
@@ -19,13 +19,13 @@ try {
   chromium = pw.chromium;
 } catch {
   console.error(`${"=".repeat(50)}`);
-  console.error("ERROR: playwright 모듈을 찾을 수 없습니다.");
+  console.error("ERROR: playwright (Node.js) 모듈을 찾을 수 없습니다.");
   console.error("");
-  console.error("  조치: 스킬 디렉토리에서 의존성을 설치하세요:");
+  console.error("  ⚠️  이 스킬은 TypeScript/Node.js입니다. Python이 아닙니다!");
+  console.error("  ⚠️  pip install playwright가 아니라 npm install이 필요합니다.");
+  console.error("");
+  console.error("  조치: 스킬 디렉토리에서 npm 의존성을 설치하세요:");
   console.error("    cd ~/.claude/skills/nanobanana-skill && npm install");
-  console.error("");
-  console.error("  또는 글로벌 설치:");
-  console.error("    npm install -g playwright");
   console.error(`${"=".repeat(50)}`);
   process.exit(1);
 }
@@ -491,7 +491,7 @@ async function generate(
 ): Promise<string[]> {
   _t0 = Date.now();
 
-  log("◆", `nanobanana-skill v0.2.2 시작 (port=${port}, count=${count})`);
+  log("◆", `nanobanana-skill v0.2.3 시작 (port=${port}, count=${count})`);
   log("◆", `프롬프트: "${prompt}"`);
 
   const browser = await chromium

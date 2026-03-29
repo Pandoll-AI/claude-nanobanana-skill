@@ -9,34 +9,40 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# Gemini Web Image Generator v0.2.2
+# Gemini Web Image Generator v0.2.3
+
+## 중요: Node.js/TypeScript 프로젝트
+
+> **이 스킬은 TypeScript(Node.js)로 작성되었습니다. Python이 아닙니다.**
+> - 실행: `npx tsx generate.ts` (Python이 아님!)
+> - 의존성: `npm install` (pip이 아님!)
+> - playwright: Node.js용 (`npm install playwright`, pip playwright 아님)
 
 ## 개요
 
 이 스킬은 사용자가 Gemini 웹 UI를 통해 이미지를 생성하도록 자동화합니다.
-Chrome을 CDP 모드로 실행하고, 사용자가 직접 로그인한 후 Playwright가 attach해서
+Chrome을 CDP 모드로 실행하고, 사용자가 직접 로그인한 후 Playwright(Node.js)가 attach해서
 프롬프트 입력 → 이미지 생성 대기 → 파일 저장을 수행합니다.
-
-v0.2.0에서는 TypeScript로 전환되었고, 워터마크 제거는 서버사이드 API를 호출합니다.
 
 ---
 
 ## 선행 조건 확인
 
-스킬 시작 전 반드시 확인:
+스킬 시작 전 반드시 확인 (모두 Node.js 기반, Python 사용 금지):
 
 ```bash
-# 1. Node.js 확인
+# 1. Node.js 확인 (필수, Python 아님!)
 node --version
 
-# 2. 스킬 디렉토리에 node_modules 존재 여부
-ls ~/.claude/skills/nanobanana-skill/node_modules/.package-lock.json 2>/dev/null && echo "DEPS_OK" || echo "DEPS_MISSING"
+# 2. 스킬 디렉토리 찾기 + node_modules 존재 여부
+SKILL_DIR=~/.claude/skills/nanobanana-skill
+ls "$SKILL_DIR/node_modules/.package-lock.json" 2>/dev/null && echo "DEPS_OK" || echo "DEPS_MISSING"
 
 # 3. CDP 포트 사용 중인지 확인
 lsof -i :9222 -sTCP:LISTEN -t 2>/dev/null && echo "ALREADY_RUNNING" || echo "NOT_RUNNING"
 ```
 
-의존성이 없으면:
+의존성이 없으면 (npm 사용, pip 아님!):
 ```bash
 cd ~/.claude/skills/nanobanana-skill && npm install
 ```
@@ -105,6 +111,8 @@ open "{저장된_경로}"
 
 | 증상 | 원인 | 조치 |
 |------|------|------|
+| `playwright 모듈을 찾을 수 없습니다` | Node.js playwright 미설치 | `cd ~/.claude/skills/nanobanana-skill && npm install` (**pip 아님!**) |
+| `Cannot find module 'playwright'` | 잘못된 디렉토리에서 실행 | SKILL_DIR에서 실행하거나 npm install |
 | `CDP 연결 실패` | Chrome이 안 열려 있음 | Step 1 재실행 |
 | `로그인이 필요합니다` | 세션 만료 | Step 2 재실행 (재로그인 요청) |
 | `텍스트 입력창을 찾을 수 없음` | 페이지 로딩 미완료 | 몇 초 후 재실행 |
