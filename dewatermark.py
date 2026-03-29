@@ -13,7 +13,7 @@ from PIL import Image
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 ALPHA_THRESHOLD = 0.002
-INPAINT_ALPHA_THRESHOLD = 0.15  # 이 이상은 inpainting으로 처리
+INPAINT_ALPHA_THRESHOLD = 0.25  # 이 이상은 inpainting으로 처리
 LOGO_VALUE = 255.0
 
 _ALPHA_MAPS: dict[str, np.ndarray] = {}
@@ -84,8 +84,8 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
     expanded_mask = np.zeros(expanded_bgr.shape[:2], dtype=np.uint8)
     expanded_mask[oy:oy+ls, ox:ox+ls] = inpaint_mask
 
-    # NS inpainting
-    inpainted_bgr = cv2.inpaint(expanded_bgr, expanded_mask, 5, cv2.INPAINT_NS)
+    # NS inpainting (radius=3 for tighter fill)
+    inpainted_bgr = cv2.inpaint(expanded_bgr, expanded_mask, 3, cv2.INPAINT_NS)
     inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
     inpainted_roi = inpainted_rgb[oy:oy+ls, ox:ox+ls, :]
 
@@ -99,10 +99,10 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
     # 고-alpha: inpainting 사용 (텍스처 기반)
     # 중간: 부드러운 전환
     # blend_weight: 0 = reverse alpha, 1 = inpainting
-    # alpha < 0.05: 100% reverse alpha
-    # alpha > 0.25: 100% inpainting
+    # alpha < 0.08: 100% reverse alpha
+    # alpha > 0.30: 100% inpainting
     # 사이: 선형 보간
-    blend_weight = np.clip((alpha_2d - 0.05) / 0.20, 0, 1)[:, :, np.newaxis]
+    blend_weight = np.clip((alpha_2d - 0.08) / 0.22, 0, 1)[:, :, np.newaxis]
 
     blended = restored * (1.0 - blend_weight) + inpainted_roi * blend_weight
 
