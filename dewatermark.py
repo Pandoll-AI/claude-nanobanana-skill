@@ -95,7 +95,7 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
     valid_3d = valid[:, :, np.newaxis]
 
     if bg_std < 5.0:
-        # 균일 배경: 외곽 평균색으로 flat fill (alpha 캘리브레이션 오차 방지)
+        # 균일 배경: 외곽 평균색으로 flat fill
         flat_bg = np.mean(bg_all, axis=0).reshape(1, 1, 3)
         img_array[y:y+ls, x:x+ls, :] = np.where(
             valid_3d,
@@ -103,8 +103,13 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
             roi
         )
     else:
-        # 복잡한 배경: reverse alpha 적용
-        img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, restored, roi)
+        # 복잡한 배경: reverse alpha + feathered blending
+        # alpha를 블렌딩 가중치로 사용: 원본과 복원의 부드러운 전환
+        # alpha 높음 → 복원 결과 신뢰 / alpha 낮음(경계) → 원본에 가깝게
+        # 이렇게 하면 경계에서 visible edge가 안 생김
+        blend_w = np.clip(alpha_2d / 0.15, 0, 1)[:, :, np.newaxis]  # 0.15에서 100%
+        feathered = roi * (1.0 - blend_w) + restored * blend_w
+        img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, feathered, roi)
 
     # --- Pass 2: Clipping 아티팩트만 inpainting으로 수정 ---
     n_fix = int(np.sum(needs_fix))
