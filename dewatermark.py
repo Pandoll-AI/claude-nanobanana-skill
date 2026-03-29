@@ -159,33 +159,36 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
 
         img_array[y:y+ls, x:x+ls, :] = blended
 
-        # --- Step 4: 외곽 transition blending ---
-        # valid 영역의 최외곽 픽셀을 바깥 배경과 블렌딩해서 전환 부드럽게
-        # erode로 내부 마스크 얻기, valid & ~eroded = 외곽 링
+        # --- Step 4: Multi-layer edge transition ---
+        # valid 경계에서 2단계 gradual transition
         kernel = np.ones((3, 3), np.uint8)
         valid_u8 = valid.astype(np.uint8)
-        eroded = cv2.erode(valid_u8, kernel, iterations=1).astype(bool)
-        outer_ring = valid & ~eroded
+        eroded1 = cv2.erode(valid_u8, kernel, iterations=1).astype(bool)
+        eroded2 = cv2.erode(valid_u8, kernel, iterations=2).astype(bool)
 
-        ring_ys, ring_xs = np.where(outer_ring)
-        for ry, rx in zip(ring_ys, ring_xs):
-            # 3x3 이웃 중 valid가 아닌(배경) 픽셀의 평균
-            ay, ax = y + ry, x + rx
-            neighbors = []
-            for dy in range(-1, 2):
-                for dx in range(-1, 2):
-                    if dy == 0 and dx == 0:
-                        continue
-                    ny, nx = ry + dy, rx + dx
-                    if 0 <= ny < ls and 0 <= nx < ls:
-                        if not valid[ny, nx]:
-                            neighbors.append(img_array[y+ny, x+nx, :])
-                    elif 0 <= ay+dy < height and 0 <= ax+dx < width:
-                        neighbors.append(img_array[ay+dy, ax+dx, :])
-            if neighbors:
-                bg_mean = np.mean(neighbors, axis=0)
-                # 50/50 블렌딩 (RA 결과 + 배경)
-                img_array[ay, ax, :] = (img_array[ay, ax, :] + bg_mean) / 2.0
+        # 외곽 ring1 (가장 바깥): 30% RA + 70% 배경
+        ring1 = valid & ~eroded1
+        # 외곽 ring2 (그 안쪽): 70% RA + 30% 배경
+        ring2 = eroded1 & ~eroded2
+
+        for ring_mask, ra_weight in [(ring1, 0.3), (ring2, 0.7)]:
+            ring_ys, ring_xs = np.where(ring_mask)
+            for ry, rx in zip(ring_ys, ring_xs):
+                ay, ax = y + ry, x + rx
+                neighbors = []
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        if dy == 0 and dx == 0:
+                            continue
+                        ny, nx = ry + dy, rx + dx
+                        if 0 <= ny < ls and 0 <= nx < ls:
+                            if not valid[ny, nx]:
+                                neighbors.append(img_array[y+ny, x+nx, :])
+                        elif 0 <= ay+dy < height and 0 <= ax+dx < width:
+                            neighbors.append(img_array[ay+dy, ax+dx, :])
+                if neighbors:
+                    bg_mean = np.mean(neighbors, axis=0)
+                    img_array[ay, ax, :] = img_array[ay, ax, :] * ra_weight + bg_mean * (1 - ra_weight)
 
     Image.fromarray(img_array.astype(np.uint8), "RGB").save(str(output_path))
 
