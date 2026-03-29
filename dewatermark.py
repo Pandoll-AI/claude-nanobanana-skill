@@ -16,7 +16,7 @@ import cv2
 from PIL import Image
 
 ASSETS_DIR = Path(__file__).parent / "assets"
-ALPHA_THRESHOLD = 0.002
+ALPHA_THRESHOLD = 0.0005
 LOGO_VALUE = 255.0
 
 _ALPHA_MAPS: dict[str, np.ndarray] = {}
@@ -145,18 +145,26 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
             fix_3d = fix_mask[:, :, np.newaxis] > 0
             ra_result = np.where(fix_3d, inpainted_roi, ra_result)
 
-        # --- Step 3: Gradient mask + bilateral filter ---
-        grad_mask = _build_gradient_mask(alpha_2d, strength=1.2)
+        # --- Step 3: Gradient mask + 경계 블렌딩 ---
+        grad_mask = _build_gradient_mask(alpha_2d, strength=1.5)
         grad_mask_3d = grad_mask[:, :, np.newaxis]
 
-        # Bilateral filter: edge-preserving blur
-        ra_u8 = np.clip(ra_result, 0, 255).astype(np.uint8)
-        smoothed = cv2.bilateralFilter(ra_u8, 9, 30, 30).astype(np.float32)
+        # 경계에서 RA 결과와 주변 배경의 부드러운 전환
+        # 확장 영역에서 bilateral filter로 배경 추정
+        pad2 = 8
+        ey1b, ey2b = max(0, y-pad2), min(height, y+ls+pad2)
+        ex1b, ex2b = max(0, x-pad2), min(width, x+ls+pad2)
+        oy2, ox2 = y - ey1b, x - ex1b
+
+        # 원본 이미지(워터마크 포함)에서 전체 영역 bilateral filter
+        region_u8 = img_array[ey1b:ey2b, ex1b:ex2b, :].astype(np.uint8)
+        region_smooth = cv2.bilateralFilter(region_u8, 15, 50, 50).astype(np.float32)
+        bg_smooth = region_smooth[oy2:oy2+ls, ox2:ox2+ls, :]
 
         # Gradient-masked soft blending
-        # 내부(mask≈0): reverse alpha 그대로
-        # 경계(mask≈1): bilateral smoothed
-        blended = ra_result * (1.0 - grad_mask_3d) + smoothed * grad_mask_3d
+        # 내부(mask≈0): reverse alpha 그대로 (수학적 정확)
+        # 경계(mask≈1): 워터마크 포함 원본의 bilateral smoothed (배경 추정)
+        blended = ra_result * (1.0 - grad_mask_3d) + bg_smooth * grad_mask_3d
 
         img_array[y:y+ls, x:x+ls, :] = blended
 
