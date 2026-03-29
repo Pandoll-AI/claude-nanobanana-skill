@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 /**
- * Gemini Web Image Generator (nanobanana-skill v0.2.3)
+ * Gemini Web Image Generator (nanobanana-skill v0.2.4)
  * CDP 모드 Chrome에 attach해서 gemini.google.com에서 이미지를 자동 생성·저장합니다.
  *
  * Usage:
@@ -29,6 +29,10 @@ try {
   console.error(`${"=".repeat(50)}`);
   process.exit(1);
 }
+
+// ─── 타입 ──────────────────────────────────────────────────────────────────
+type GeminiModel = "fast" | "thinking" | "pro" | "auto";
+const MODEL_OPTIONS: GeminiModel[] = ["fast", "thinking", "pro", "auto"];
 
 // ─── 상수 ──────────────────────────────────────────────────────────────────
 const GEMINI_URL = "https://gemini.google.com/app";
@@ -61,6 +65,51 @@ function logErr(msg: string) {
 
 function logDetail(msg: string) {
   console.error(`[${elapsed().padStart(6)}]   ${msg}`);
+}
+
+// ─── 프롬프트 자동 분류 ──────────────────────────────────────────────────
+function classifyPrompt(prompt: string): GeminiModel {
+  const lower = prompt.toLowerCase();
+  const words = prompt.split(/\s+/).length;
+
+  const PRO_KEYWORDS = [
+    "game mechanic", "algorithm", "simulate", "state machine", "physics",
+    "combat", "inventory", "procedural", "behavior", "movement",
+    "8-directional", "sprite sheet", "animation frame", "walk cycle",
+    "idle animation", "attack animation", "character action",
+    "tile map", "collision", "pathfinding", "particle system",
+    "parallax", "isometric", "top-down", "side-scrolling",
+    "게임 캐릭터", "움직임", "동작", "스프라이트", "8방향",
+  ];
+
+  const THINKING_KEYWORDS = [
+    "photorealistic", "cinematic", "concept art", "intricate detail",
+    "environment design", "composition", "lighting setup", "art style",
+    "hyper detailed", "masterpiece", "oil painting", "watercolor",
+    "digital painting", "matte painting", "studio ghibli",
+    "renaissance", "baroque", "impressionist", "surrealism",
+    "depth of field", "golden hour", "dramatic lighting",
+    "character design", "costume design", "architectural",
+    "풍경화", "세밀한", "사실적", "명화 스타일", "컨셉 아트",
+  ];
+
+  let proScore = 0;
+  let thinkingScore = 0;
+
+  for (const kw of PRO_KEYWORDS) {
+    if (lower.includes(kw)) proScore++;
+  }
+  for (const kw of THINKING_KEYWORDS) {
+    if (lower.includes(kw)) thinkingScore++;
+  }
+
+  // 긴 프롬프트는 상세 묘사일 가능성 높음
+  if (words > 30) thinkingScore++;
+  if (words > 50) thinkingScore++;
+
+  if (proScore >= 2) return "pro";
+  if (thinkingScore >= 2) return "thinking";
+  return "fast";
 }
 
 // ─── 유틸 ──────────────────────────────────────────────────────────────────
@@ -159,6 +208,85 @@ async function findInput(page: any) {
     } catch {}
   }
   return null;
+}
+
+// ─── Gemini 모델 선택 ────────────────────────────────────────────────────
+async function selectGeminiModel(
+  page: any,
+  model: GeminiModel
+): Promise<boolean> {
+  if (model === "auto") return true; // auto는 여기 오기 전에 resolve됨
+
+  const MODEL_LABELS: Record<string, string[]> = {
+    fast: ["fast", "빠른"],
+    thinking: ["thinking", "사고"],
+    pro: ["pro", "프로"],
+  };
+
+  try {
+    // 현재 모드 확인 — 이미 맞으면 skip
+    const PICKER_SELECTORS = [
+      "button[aria-label*='mode picker']",
+      "button[aria-label*='모드']",
+      ".input-area-switch",
+      "button.input-area-switch",
+    ];
+
+    let pickerBtn = null;
+    for (const sel of PICKER_SELECTORS) {
+      try {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible({ timeout: 1500 })) {
+          pickerBtn = loc;
+          break;
+        }
+      } catch {}
+    }
+
+    if (!pickerBtn) {
+      logDetail("모드 피커 버튼을 찾을 수 없음 — 기본 모드로 진행");
+      return false;
+    }
+
+    // 현재 선택된 모드 텍스트 확인
+    const currentText = ((await pickerBtn.textContent()) || "").toLowerCase();
+    const targetLabels = MODEL_LABELS[model] || [model];
+    if (targetLabels.some((label) => currentText.includes(label))) {
+      logDetail(`이미 ${model} 모드 — 변경 불필요`);
+      return true;
+    }
+
+    // 피커 클릭 → 메뉴 열기
+    await pickerBtn.click();
+    await sleep(800);
+
+    // 메뉴 아이템 탐색
+    const menuItems = await page.locator("[role='menuitem']").all();
+    let targetItem = null;
+
+    for (const item of menuItems) {
+      const text = ((await item.textContent()) || "").toLowerCase();
+      if (targetLabels.some((label) => text.includes(label))) {
+        targetItem = item;
+        break;
+      }
+    }
+
+    if (!targetItem) {
+      logDetail(`메뉴에서 ${model} 모드를 찾을 수 없음`);
+      try { await page.keyboard.press("Escape"); } catch {}
+      return false;
+    }
+
+    await targetItem.click();
+    await sleep(500);
+    logDetail(`${model} 모드 선택 완료`);
+    return true;
+  } catch (e: any) {
+    logDetail(`모델 선택 실패 (무시): ${e.message || e}`);
+    try { await page.keyboard.press("Escape"); } catch {}
+    return false;
+  }
 }
 
 // ─── 다운로드 버튼 저장 ──────────────────────────────────────────────────
@@ -487,11 +615,12 @@ async function generate(
   prompt: string,
   outDir: string,
   count: number,
-  port: number
+  port: number,
+  model: GeminiModel = "auto"
 ): Promise<string[]> {
   _t0 = Date.now();
 
-  log("◆", `nanobanana-skill v0.2.3 시작 (port=${port}, count=${count})`);
+  log("◆", `nanobanana-skill v0.2.4 시작 (port=${port}, count=${count}, model=${model})`);
   log("◆", `프롬프트: "${prompt}"`);
 
   const browser = await chromium
@@ -587,6 +716,11 @@ async function generate(
       );
     }
 
+    // 모델 선택 (프롬프트 입력 전)
+    const effectiveModel = model === "auto" ? classifyPrompt(prompt) : model;
+    log("→", `모델 선택: ${effectiveModel}${model === "auto" ? " (자동)" : " (수동)"}`);
+    await selectGeminiModel(page, effectiveModel);
+
     // 프롬프트 입력
     log("→", "프롬프트 전송...");
     await inp.click({ force: true });
@@ -652,6 +786,7 @@ async function main() {
       count: { type: "string", default: "1" },
       port: { type: "string", default: "9222" },
       timeout: { type: "string", default: "180" },
+      model: { type: "string", default: "auto" },
       dewatermark: { type: "boolean", default: false },
     },
     allowPositionals: true,
@@ -672,14 +807,21 @@ async function main() {
     process.exit(1);
   }
 
-  DEFAULT_TIMEOUT = (parseInt(values.timeout as string) || 90) * 1000;
+  DEFAULT_TIMEOUT = (parseInt(values.timeout as string) || 180) * 1000;
+
+  const modelArg = (values.model as string || "auto").toLowerCase() as GeminiModel;
+  if (!MODEL_OPTIONS.includes(modelArg)) {
+    console.error(`ERROR: --model은 ${MODEL_OPTIONS.join(", ")} 중 하나여야 합니다.`);
+    process.exit(1);
+  }
 
   try {
     const paths = await generate(
       prompt,
       values.out as string,
       count,
-      parseInt(values.port as string) || 9222
+      parseInt(values.port as string) || 9222,
+      modelArg
     );
 
     if (paths.length > 0) {

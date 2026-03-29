@@ -9,7 +9,7 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# Gemini Web Image Generator v0.2.3
+# Gemini Web Image Generator v0.2.4
 
 ## 중요: Node.js/TypeScript 프로젝트
 
@@ -86,13 +86,19 @@ npx tsx "$SKILL_DIR/generate.ts" \
   --out "{OUT_DIR}" \
   --count {COUNT} \
   --port 9222 \
-  --timeout 180
+  --timeout 180 \
+  --model {MODEL}
 ```
 
 변수:
 - `{PROMPT}`: 사용자가 요청한 이미지 설명 (영어로 번역하면 품질 향상)
 - `{OUT_DIR}`: 저장 경로 (사용자가 지정 없으면 `~/Desktop`)
 - `{COUNT}`: 저장할 이미지 수 (기본 1, 최대 8)
+- `{MODEL}`: `auto` | `fast` | `thinking` | `pro` (기본 `auto`)
+  - `auto`: 프롬프트 복잡도에 따라 자동 선택
+  - `fast`: 간단한 이미지, 빠른 생성
+  - `thinking`: 상세한 묘사, 복잡한 구도
+  - `pro`: 게임 캐릭터 동작, 논리적/행동 기반 이미지
 
 ---
 

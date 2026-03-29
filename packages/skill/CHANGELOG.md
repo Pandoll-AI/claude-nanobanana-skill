@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.4] - 2026-03-29
+
+### Added
+- **Gemini 모델 자동 선택** (`--model auto|fast|thinking|pro`)
+  - `auto` (기본값): 프롬프트 키워드 점수 기반 자동 분류
+  - pro: 게임 캐릭터 동작, 스프라이트, 물리/충돌 등 행동·로직 관련
+  - thinking: 사실적 묘사, 컨셉 아트, 복잡한 구도 등 상세 아트 관련
+  - fast: 간단한 프롬프트, 랜덤 이미지 (기본 fallback)
+- `classifyPrompt()`: 키워드 매칭 + 단어 수 기반 경량 분류 함수
+- `selectGeminiModel()`: DOM 모드 피커 조작 (실패 시 silent skip)
+
 ## [0.2.3] - 2026-03-29
 
 ### Fixed
