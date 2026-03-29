@@ -1,5 +1,5 @@
 {
-  "name": "nanobanana",
+  "name": "pandoll-ai-skills",
   "owner": {
     "name": "Pandoll-AI"
   },
@@ -8,8 +8,8 @@
   },
   "plugins": [
     {
-      "name": "nanobanana-plugin",
-      "source": "./plugins/nanobanana-plugin",
+      "name": "nanobanana-skill",
+      "source": "./plugins/nanobanana-skill",
       "description": "Gemini 웹 이미지 생성 자동화 + 워터마크 제거. Chrome CDP로 gemini.google.com을 자동 조작하여 이미지를 생성하고, geminiwatermarkfree.vercel.app API로 워터마크를 감지/제거합니다.",
       "version": "0.2.0",
       "keywords": ["gemini", "image-generation", "watermark", "automation", "imagen"]
