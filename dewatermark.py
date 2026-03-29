@@ -114,35 +114,8 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
     # 경계(grad_mask ≈ 1): denoised 결과 (아티팩트 제거)
     blended_roi = ra_result * (1.0 - grad_mask_3d) + denoised_f * grad_mask_3d
 
-    # --- Step 5: Poisson blending으로 경계 연속성 ---
-    # ROI를 원본 이미지에 자연스럽게 합성
-    img_u8 = img_array.astype(np.uint8).copy()
-    src_patch = np.clip(blended_roi, 0, 255).astype(np.uint8)
-
-    # seamlessClone용 마스크 (valid 영역)
-    clone_mask = (valid.astype(np.uint8) * 255)
-    # 마스크를 약간 축소 (경계 1px은 blending에 사용)
-    kernel = np.ones((3, 3), np.uint8)
-    clone_mask = cv2.erode(clone_mask, kernel, iterations=1)
-
-    if clone_mask.sum() > 0:
-        # BGR 변환
-        dst_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
-        src_bgr = cv2.cvtColor(src_patch, cv2.COLOR_RGB2BGR)
-
-        # center 좌표
-        cx = x + ls // 2
-        cy = y + ls // 2
-
-        try:
-            result_bgr = cv2.seamlessClone(src_bgr, dst_bgr, clone_mask, (cx, cy), cv2.MIXED_CLONE)
-            result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-            img_array = result_rgb.astype(np.float32)
-        except cv2.error:
-            # seamlessClone 실패 시 직접 적용
-            img_array[y:y+ls, x:x+ls, :] = blended_roi
-    else:
-        img_array[y:y+ls, x:x+ls, :] = blended_roi
+    # --- Step 5: 결과 적용 ---
+    img_array[y:y+ls, x:x+ls, :] = blended_roi
 
     Image.fromarray(img_array.astype(np.uint8), "RGB").save(str(output_path))
 
