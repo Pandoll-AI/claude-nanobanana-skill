@@ -110,18 +110,27 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
         w_right[:,:,np.newaxis] * bg_right[:,np.newaxis,:]
     ) / w_sum[:,:,np.newaxis]
 
-    # Step 4: alpha-proportional 블렌딩
-    # alpha 낮음(경계) → reverse alpha 신뢰 → weight_ra 높음
-    # alpha 높음(중심) → 배경 추정 사용 → weight_bg 높음
+    # Step 4: 배경 균일성 판별 후 전략 선택
     alpha_2d = alpha_map[:ls, :ls]
-    # 블렌딩 계수: alpha^2로 비선형화 (경계 근처에서 reverse alpha 더 신뢰)
-    blend_factor = (alpha_2d ** 2)[:, :, np.newaxis]
 
-    blended = restored * (1.0 - blend_factor) + bg_estimate * blend_factor
+    # 4변 배경의 표준편차 → 균일한지 판별
+    bg_all = np.concatenate([
+        bg_top.reshape(-1, 3), bg_bot.reshape(-1, 3),
+        bg_left.reshape(-1, 3), bg_right.reshape(-1, 3)
+    ], axis=0)
+    bg_std = np.std(bg_all, axis=0).mean()
 
-    # needs_interp 영역은 100% 배경 추정 사용
-    needs_interp_3d = needs_interp[:, :, np.newaxis]
-    blended = np.where(needs_interp_3d, bg_estimate, blended)
+    if bg_std < 3.0:
+        # 균일 배경: 외곽 평균색으로 flat fill (reverse alpha noise 방지)
+        flat_bg = np.mean(bg_all, axis=0).reshape(1, 1, 3)
+        blended = np.broadcast_to(flat_bg, (ls, ls, 3)).copy().astype(np.float32)
+    else:
+        # 복잡한 배경: alpha^2 비례 블렌딩
+        blend_factor = (alpha_2d ** 2)[:, :, np.newaxis]
+        blended = restored * (1.0 - blend_factor) + bg_estimate * blend_factor
+        # needs_interp 영역은 100% 배경 추정 사용
+        needs_interp_3d = needs_interp[:, :, np.newaxis]
+        blended = np.where(needs_interp_3d, bg_estimate, blended)
 
     # valid 영역만 적용
     valid_3d = valid[:, :, np.newaxis]
