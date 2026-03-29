@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.2] - 2026-03-29
+
+### Fixed (Critical)
+- **POLL_JS IIFE 버그**: `page.evaluate("() => { ... }")` → `page.evaluate("(() => { ... })()")` 변경. 문자열로 된 화살표 함수가 Playwright에서 정의만 되고 호출되지 않아 항상 `undefined` 반환 → 이미지 감지 불가의 근본 원인
+- playwright 모듈 미설치 시 `Cannot find module` 크래시 대신 명확한 설치 안내 메시지 출력 후 종료
+
+### Improved
+- 한국어 Gemini UI 대응: `img[alt*='AI로 생성']` 셀렉터 추가 (기존 영어 `AI generated`만 지원)
+- POLL_JS 2단계 fallback: 명시적 셀렉터 매치 실패 시 `model-response` 내 큰 이미지 자동 수집
+- `saveViaDownloadButton`: 아이콘/아바타 제외를 위한 boundingBox 크기 필터 추가
+- playwright를 dynamic import로 변경하여 모듈 부재 시 graceful 종료
+
 ## [0.2.1] - 2026-03-29
 
 ### Fixed

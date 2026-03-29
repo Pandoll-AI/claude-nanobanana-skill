@@ -1,17 +1,34 @@
 #!/usr/bin/env npx tsx
 /**
- * Gemini Web Image Generator (nanobanana-skill v0.2.1)
+ * Gemini Web Image Generator (nanobanana-skill v0.2.2)
  * CDP 모드 Chrome에 attach해서 gemini.google.com에서 이미지를 자동 생성·저장합니다.
  *
  * Usage:
  *   npx tsx generate.ts "a futuristic city at night" [--out ~/Desktop] [--count 1] [--port 9222]
  */
-import { chromium } from "playwright";
 import { mkdirSync, writeFileSync, statSync, existsSync } from "fs";
 import { join, resolve } from "path";
 import { homedir } from "os";
 import { parseArgs } from "util";
 import { dewatermark } from "./dewatermark-client.js";
+
+// playwright 동적 임포트 — 없으면 명확한 안내 후 종료
+let chromium: any;
+try {
+  const pw = await import("playwright");
+  chromium = pw.chromium;
+} catch {
+  console.error(`${"=".repeat(50)}`);
+  console.error("ERROR: playwright 모듈을 찾을 수 없습니다.");
+  console.error("");
+  console.error("  조치: 스킬 디렉토리에서 의존성을 설치하세요:");
+  console.error("    cd ~/.claude/skills/nanobanana-skill && npm install");
+  console.error("");
+  console.error("  또는 글로벌 설치:");
+  console.error("    npm install -g playwright");
+  console.error(`${"=".repeat(50)}`);
+  process.exit(1);
+}
 
 // ─── 상수 ──────────────────────────────────────────────────────────────────
 const GEMINI_URL = "https://gemini.google.com/app";
@@ -64,21 +81,44 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ─── 이미지 폴링 JS ───────────────────────────────────────────────────────
-const POLL_JS = `() => {
+const POLL_JS = `(() => {
+    // 1단계: 명시적 셀렉터로 이미지 탐색
     const selectors = [
         "img[alt*='AI generated']",
+        "img[alt*='AI로 생성']",
+        "img[alt*='Generated image']",
         "img.image.loaded",
         "img.image",
         "model-response img",
+        ".response-container img",
+        "message-content img",
+        ".image-button img",
+        "[class*='generated'] img",
     ];
     const seen = new Set();
     const images = [];
     for (const sel of selectors) {
-        for (const img of document.querySelectorAll(sel)) {
-            const src = img.src || '';
-            if (src && !seen.has(src) && img.width > 50) {
-                seen.add(src);
-                images.push(src);
+        try {
+            for (const img of document.querySelectorAll(sel)) {
+                const src = img.src || '';
+                if (src && !seen.has(src) && img.width > 50) {
+                    seen.add(src);
+                    images.push(src);
+                }
+            }
+        } catch {}
+    }
+
+    // 2단계: 셀렉터 매치 0이면 model-response 내 큰 이미지 전부 수집 (UI 변경 대비)
+    if (images.length === 0) {
+        const resp = document.querySelector('model-response:last-of-type') || document.querySelector('.response-container:last-of-type');
+        if (resp) {
+            for (const img of resp.querySelectorAll('img')) {
+                const src = img.src || '';
+                if (src && !seen.has(src) && img.width > 100 && img.height > 100) {
+                    seen.add(src);
+                    images.push(src);
+                }
             }
         }
     }
@@ -102,7 +142,7 @@ const POLL_JS = `() => {
     ).length > 0;
 
     return { images, error, loading };
-}`;
+})()`;
 
 // ─── 입력창 찾기 ──────────────────────────────────────────────────────────
 async function findInput(page: any) {
@@ -132,13 +172,24 @@ async function saveViaDownloadButton(
     let imgEl = null;
     for (const sel of [
       "img[alt*='AI generated']",
+      "img[alt*='Generated image']",
       "img.image.loaded",
       "img.image",
+      ".image-button img",
+      "model-response img",
     ]) {
       try {
         const els = await page.locator(sel).all();
-        if (index < els.length) {
-          imgEl = els[index];
+        // 큰 이미지만 필터 (아이콘/아바타 제외)
+        const bigEls = [];
+        for (const el of els) {
+          try {
+            const box = await el.boundingBox();
+            if (box && box.width > 80 && box.height > 80) bigEls.push(el);
+          } catch { bigEls.push(el); }
+        }
+        if (index < bigEls.length) {
+          imgEl = bigEls[index];
           break;
         }
       } catch {
@@ -306,8 +357,11 @@ async function saveImageFromSrc(
       logDetail("canvas 실패 → element screenshot fallback");
       for (const sel of [
         "img[alt*='AI generated']",
+        "img[alt*='Generated image']",
         "img.image.loaded",
         "img.image",
+        ".image-button img",
+        "model-response img",
       ]) {
         try {
           const els = await page.locator(sel).all();
@@ -437,7 +491,7 @@ async function generate(
 ): Promise<string[]> {
   _t0 = Date.now();
 
-  log("◆", `nanobanana-skill v0.2.1 시작 (port=${port}, count=${count})`);
+  log("◆", `nanobanana-skill v0.2.2 시작 (port=${port}, count=${count})`);
   log("◆", `프롬프트: "${prompt}"`);
 
   const browser = await chromium

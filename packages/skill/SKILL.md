@@ -9,7 +9,7 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# Gemini Web Image Generator v0.2.1
+# Gemini Web Image Generator v0.2.2
 
 ## 개요
 
