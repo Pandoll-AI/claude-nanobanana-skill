@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Gemini 이미지 워터마크 제거 — Reverse Alpha Blending + 보간 보정.
+Gemini 이미지 워터마크 제거 — 하이브리드: Reverse Alpha + OpenCV Inpainting.
+저-alpha 경계: reverse alpha blending (수학적으로 정확)
+고-alpha 중심: OpenCV NS inpainting (텍스처 기반 복원)
 """
 
 import sys, time
 from pathlib import Path
 import numpy as np
-from PIL import Image, ImageFilter
+import cv2
+from PIL import Image
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 ALPHA_THRESHOLD = 0.002
-MAX_ALPHA = 0.99
+INPAINT_ALPHA_THRESHOLD = 0.15  # 이 이상은 inpainting으로 처리
 LOGO_VALUE = 255.0
 
 _ALPHA_MAPS: dict[str, np.ndarray] = {}
@@ -57,120 +60,64 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
 
     img_array = np.array(img, dtype=np.float32)
     roi = img_array[y:y+ls, x:x+ls, :].copy()
-    alpha = alpha_map[:ls, :ls, np.newaxis]
-    valid = alpha_map[:ls, :ls] > ALPHA_THRESHOLD
-    alpha_clamped = np.clip(alpha, 0, MAX_ALPHA)
+    alpha_2d = alpha_map[:ls, :ls]
+    alpha_3d = alpha_2d[:, :, np.newaxis]
+    valid = alpha_2d > ALPHA_THRESHOLD
 
-    # Step 1: Reverse alpha blending
-    raw_restored = (roi - alpha_clamped * LOGO_VALUE) / (1.0 - alpha_clamped)
+    # --- Phase 1: OpenCV Inpainting으로 고-alpha 영역 복원 ---
+    # inpainting mask: alpha > threshold인 영역
+    inpaint_mask = (alpha_2d > INPAINT_ALPHA_THRESHOLD).astype(np.uint8) * 255
 
-    # Step 2: 음수로 clamp된 픽셀 감지 (= 복원 불가 영역)
-    # 이 픽셀들은 워터마크가 배경보다 밝아서 수학적으로 복원 불가
-    needs_interp = (raw_restored < 0).any(axis=2) | (raw_restored > 255).any(axis=2)
-    needs_interp = needs_interp & valid  # valid 영역에서만
-
-    restored = np.clip(raw_restored, 0, 255)
-
-    # Step 3: 주변 배경 평균 추정 (ROI 외곽 ring에서)
-    pad = 5
+    # 확장 영역에서 inpainting (경계 참조를 위해 padding)
+    pad = 8
     ey1, ey2 = max(0, y-pad), min(height, y+ls+pad)
     ex1, ex2 = max(0, x-pad), min(width, x+ls+pad)
-    expanded = img_array[ey1:ey2, ex1:ex2, :].copy()
     oy, ox = y - ey1, x - ex1
 
-    # 4변 외곽 strip에서 배경색 추정 (per-row/col 보간용)
-    # 상변 배경 (y-1 row)
-    bg_top = expanded[max(0,oy-1), ox:ox+ls, :] if oy > 0 else roi[0, :, :]
-    # 하변 배경 (y+ls row)
-    bg_bot_y = min(oy+ls, expanded.shape[0]-1)
-    bg_bot = expanded[bg_bot_y, ox:ox+ls, :] if oy+ls < expanded.shape[0] else roi[-1, :, :]
-    # 좌변 배경
-    bg_left = expanded[oy:oy+ls, max(0,ox-1), :] if ox > 0 else roi[:, 0, :]
-    # 우변 배경
-    bg_right_x = min(ox+ls, expanded.shape[1]-1)
-    bg_right = expanded[oy:oy+ls, bg_right_x, :] if ox+ls < expanded.shape[1] else roi[:, -1, :]
+    # 확장 영역 BGR (OpenCV 형식)
+    expanded_bgr = cv2.cvtColor(
+        img_array[ey1:ey2, ex1:ex2, :].astype(np.uint8),
+        cv2.COLOR_RGB2BGR
+    )
 
-    # 각 픽셀의 "추정 배경" = 4변까지의 거리 역가중 평균
-    yy, xx = np.mgrid[0:ls, 0:ls]
-    d_top = (yy + 1).astype(np.float32)
-    d_bot = (ls - yy).astype(np.float32)
-    d_left = (xx + 1).astype(np.float32)
-    d_right = (ls - xx).astype(np.float32)
+    # 확장 영역 크기의 마스크 (padding 영역은 0)
+    expanded_mask = np.zeros(expanded_bgr.shape[:2], dtype=np.uint8)
+    expanded_mask[oy:oy+ls, ox:ox+ls] = inpaint_mask
 
-    w_top = 1.0 / d_top
-    w_bot = 1.0 / d_bot
-    w_left = 1.0 / d_left
-    w_right = 1.0 / d_right
-    w_sum = w_top + w_bot + w_left + w_right
+    # NS inpainting
+    inpainted_bgr = cv2.inpaint(expanded_bgr, expanded_mask, 5, cv2.INPAINT_NS)
+    inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    inpainted_roi = inpainted_rgb[oy:oy+ls, ox:ox+ls, :]
 
-    bg_estimate = (
-        w_top[:,:,np.newaxis] * bg_top[np.newaxis,:,:] +
-        w_bot[:,:,np.newaxis] * bg_bot[np.newaxis,:,:] +
-        w_left[:,:,np.newaxis] * bg_left[:,np.newaxis,:] +
-        w_right[:,:,np.newaxis] * bg_right[:,np.newaxis,:]
-    ) / w_sum[:,:,np.newaxis]
+    # --- Phase 2: Reverse Alpha로 저-alpha 경계 복원 ---
+    alpha_clamped = np.clip(alpha_3d, 0, 0.99)
+    raw_restored = (roi - alpha_clamped * LOGO_VALUE) / (1.0 - alpha_clamped)
+    restored = np.clip(raw_restored, 0, 255)
 
-    # Step 4: 배경 균일성 판별 후 전략 선택
-    alpha_2d = alpha_map[:ls, :ls]
+    # --- Phase 3: 블렌딩 ---
+    # 저-alpha: reverse alpha 사용 (정확)
+    # 고-alpha: inpainting 사용 (텍스처 기반)
+    # 중간: 부드러운 전환
+    # blend_weight: 0 = reverse alpha, 1 = inpainting
+    # alpha < 0.05: 100% reverse alpha
+    # alpha > 0.25: 100% inpainting
+    # 사이: 선형 보간
+    blend_weight = np.clip((alpha_2d - 0.05) / 0.20, 0, 1)[:, :, np.newaxis]
 
-    # 4변 배경의 표준편차 → 균일한지 판별
-    bg_all = np.concatenate([
-        bg_top.reshape(-1, 3), bg_bot.reshape(-1, 3),
-        bg_left.reshape(-1, 3), bg_right.reshape(-1, 3)
-    ], axis=0)
-    bg_std = np.std(bg_all, axis=0).mean()
-
-    if bg_std < 3.0:
-        # 균일 배경: 외곽 평균색으로 flat fill (reverse alpha noise 방지)
-        flat_bg = np.mean(bg_all, axis=0).reshape(1, 1, 3)
-        blended = np.broadcast_to(flat_bg, (ls, ls, 3)).copy().astype(np.float32)
-    else:
-        # 복잡한 배경: alpha^2 비례 블렌딩
-        blend_factor = (alpha_2d ** 2)[:, :, np.newaxis]
-        blended = restored * (1.0 - blend_factor) + bg_estimate * blend_factor
-        # needs_interp 영역은 100% 배경 추정 사용
-        needs_interp_3d = needs_interp[:, :, np.newaxis]
-        blended = np.where(needs_interp_3d, bg_estimate, blended)
+    blended = restored * (1.0 - blend_weight) + inpainted_roi * blend_weight
 
     # valid 영역만 적용
     valid_3d = valid[:, :, np.newaxis]
     img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, blended, roi)
 
-    # Step 5: 경계 1px 스무딩 — 처리 영역과 원본의 전환점에서 평균
-    final_roi = img_array[y:y+ls, x:x+ls, :].copy()
-    orig_roi = roi.copy()  # 원본 워터마크 포함 ROI
+    Image.fromarray(img_array.astype(np.uint8), "RGB").save(str(output_path))
 
-    # 상변: final_roi[0,:] = avg(img_array[y-1,:], final_roi[1,:])
-    if y > 0:
-        outer = img_array[y-1, x:x+ls, :]
-        inner = final_roi[1, :, :] if ls > 1 else final_roi[0, :, :]
-        final_roi[0, :, :] = (outer + inner) / 2.0
-    # 하변
-    if y + ls < height:
-        outer = img_array[y+ls, x:x+ls, :]
-        inner = final_roi[-2, :, :] if ls > 1 else final_roi[-1, :, :]
-        final_roi[-1, :, :] = (outer + inner) / 2.0
-    # 좌변
-    if x > 0:
-        outer = img_array[y:y+ls, x-1, :]
-        inner = final_roi[:, 1, :] if ls > 1 else final_roi[:, 0, :]
-        final_roi[:, 0, :] = (outer + inner) / 2.0
-    # 우변
-    if x + ls < width:
-        outer = img_array[y:y+ls, x+ls, :]
-        inner = final_roi[:, -2, :] if ls > 1 else final_roi[:, -1, :]
-        final_roi[:, -1, :] = (outer + inner) / 2.0
-
-    img_array[y:y+ls, x:x+ls, :] = final_roi
-
-    final_img = Image.fromarray(img_array.astype(np.uint8), "RGB")
-    final_img.save(str(output_path))
-
+    n_inpaint = int(np.sum(alpha_2d > INPAINT_ALPHA_THRESHOLD))
     return {
         "success": True,
         "elapsed_ms": round((time.time() - t0) * 1000, 1),
         "pixels_modified": int(np.sum(valid)),
-        "pixels_interpolated": int(np.sum(needs_interp)),
+        "pixels_inpainted": n_inpaint,
         "logo_size": ls,
         "position": (x, y),
         "alpha_src": src_name,
@@ -185,14 +132,14 @@ def main():
     args = parser.parse_args()
     if args.dir:
         for img in sorted(Path(args.dir).glob("*.png")):
-            if "_clean" in img.stem: continue
+            if "_clean" in img.stem or "_exp" in img.stem: continue
             out = img.parent / f"{img.stem}_clean{img.suffix}"
             r = remove_watermark(img, out)
-            print(f"  {'✓' if r['success'] else '✗'} {img.name} ({r.get('elapsed_ms',0):.0f}ms, interp={r.get('pixels_interpolated',0)})")
+            print(f"  {'✓' if r['success'] else '✗'} {img.name} ({r.get('elapsed_ms',0):.0f}ms)")
     elif args.image:
         r = remove_watermark(args.image, args.output)
         if r["success"]:
-            print(f"완료: {args.output or args.image} ({r['pixels_modified']}px, interp={r['pixels_interpolated']}px, {r['elapsed_ms']:.0f}ms)")
+            print(f"완료: {args.output or args.image} ({r['pixels_modified']}px, {r['elapsed_ms']:.0f}ms)")
         else:
             print(f"ERROR: {r['error']}", file=sys.stderr); sys.exit(1)
     else:
