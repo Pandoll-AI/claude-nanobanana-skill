@@ -3,13 +3,17 @@
 ## [0.2.4] - 2026-03-29
 
 ### Added
-- **Gemini 모델 자동 선택** (`--model auto|fast|thinking|pro`)
-  - `auto` (기본값): 프롬프트 키워드 점수 기반 자동 분류
-  - pro: 게임 캐릭터 동작, 스프라이트, 물리/충돌 등 행동·로직 관련
-  - thinking: 사실적 묘사, 컨셉 아트, 복잡한 구도 등 상세 아트 관련
-  - fast: 간단한 프롬프트, 랜덤 이미지 (기본 fallback)
+- **Gemini 모델 선택** (`--model fast|thinking|pro|auto`)
+  - Claude가 SKILL.md 기준 테이블을 보고 직접 판단하여 지정하는 것이 기본
+  - `auto`는 키워드 자동 분류 fallback (정확도 낮음)
 - `classifyPrompt()`: 키워드 매칭 + 단어 수 기반 경량 분류 함수
 - `selectGeminiModel()`: DOM 모드 피커 조작 (실패 시 silent skip)
+
+### Refactored (review)
+- `IMG_SELECTORS` 상수 추출 — 3곳에 중복되던 이미지 셀렉터 배열을 1곳으로 통합
+- `page.evaluate` 비-IIFE 패턴 2곳 추가 수정 (fullSrc 추출, overlay dismiss)
+- 다운로드 버튼 셀렉터 dead code 제거 (exact match가 contains match에 포함됨)
+- usage 문자열에 `--model` 옵션 추가
 
 ## [0.2.3] - 2026-03-29
 
