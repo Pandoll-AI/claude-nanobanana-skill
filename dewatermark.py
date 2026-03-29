@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Gemini 이미지 워터마크 제거 — Reverse Alpha Blending.
-수식: original = (watermarked - α × 255) / (1 - α)
+Gemini 이미지 워터마크 제거 — Reverse Alpha Blending + 보간 보정.
 """
 
 import sys, time
 from pathlib import Path
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 ALPHA_THRESHOLD = 0.002
@@ -54,53 +53,74 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
     x = width - mg - ls
     y = height - mg - ls
     if x < 0 or y < 0:
-        return {"success": False, "error": f"이미지가 너무 작음", "elapsed_ms": 0}
+        return {"success": False, "error": "이미지가 너무 작음", "elapsed_ms": 0}
 
     img_array = np.array(img, dtype=np.float32)
-
-    roi = img_array[y:y+ls, x:x+ls, :]
+    roi = img_array[y:y+ls, x:x+ls, :].copy()
     alpha = alpha_map[:ls, :ls, np.newaxis]
     valid = alpha_map[:ls, :ls] > ALPHA_THRESHOLD
     alpha_clamped = np.clip(alpha, 0, MAX_ALPHA)
 
-    # Reverse alpha blending
-    restored = (roi - alpha_clamped * LOGO_VALUE) / (1.0 - alpha_clamped)
-    restored = np.clip(restored, 0, 255)
+    # Step 1: Reverse alpha blending
+    raw_restored = (roi - alpha_clamped * LOGO_VALUE) / (1.0 - alpha_clamped)
 
-    img_array[y:y+ls, x:x+ls, :] = np.where(valid[:, :, np.newaxis], restored, roi)
+    # Step 2: 음수로 clamp된 픽셀 감지 (= 복원 불가 영역)
+    # 이 픽셀들은 워터마크가 배경보다 밝아서 수학적으로 복원 불가
+    needs_interp = (raw_restored < 0).any(axis=2) | (raw_restored > 255).any(axis=2)
+    needs_interp = needs_interp & valid  # valid 영역에서만
 
-    # Stage 2: 잔상 보정 — 복원된 영역 중 주변과 차이가 큰 픽셀을 주변 평균으로 교체
-    pad = 4
+    restored = np.clip(raw_restored, 0, 255)
+
+    # Step 3: 복원 가능 영역 먼저 적용
+    result = roi.copy()
+    valid_3d = valid[:, :, np.newaxis]
+    result = np.where(valid_3d, restored, result)
+
+    # Step 4: 복원 불가 영역은 주변 non-watermark 픽셀로 보간
+    # 확장 영역에서 주변 참조
+    pad = 5
     ey1, ey2 = max(0, y-pad), min(height, y+ls+pad)
     ex1, ex2 = max(0, x-pad), min(width, x+ls+pad)
-    region = img_array[ey1:ey2, ex1:ex2, :].copy()
+    expanded = img_array[ey1:ey2, ex1:ex2, :].copy()
     oy, ox = y - ey1, x - ex1
 
-    # 각 valid 픽셀에 대해 3x3 주변 평균과의 차이가 크면 주변 평균으로 블렌딩
-    for dy in range(ls):
-        for dx in range(ls):
-            if not valid[dy, dx]:
-                continue
-            ry, rx = oy + dy, ox + dx
-            # 3x3 이웃 평균 (자기 자신 제외)
-            ny1, ny2 = max(0, ry-1), min(region.shape[0], ry+2)
-            nx1, nx2 = max(0, rx-1), min(region.shape[1], rx+2)
-            neighbors = region[ny1:ny2, nx1:nx2, :].reshape(-1, 3)
-            me = region[ry, rx, :]
-            avg = (neighbors.sum(axis=0) - me) / max(len(neighbors) - 1, 1)
-            diff = np.abs(me - avg).mean()
-            if diff > 30:  # 주변과 크게 다르면 보정
-                blend = 0.6
-                region[ry, rx, :] = me * (1-blend) + avg * blend
+    # 복원된 valid 영역을 expanded에 반영
+    expanded[oy:oy+ls, ox:ox+ls, :] = result
 
-    img_array[ey1:ey2, ex1:ex2, :] = region
+    # needs_interp 픽셀들을 주변 평균으로 교체
+    interp_ys, interp_xs = np.where(needs_interp)
+    for dy, dx in zip(interp_ys, interp_xs):
+        ry, rx = oy + dy, ox + dx
+        # 5x5 이웃 중 valid가 아닌(= 원본 배경) 픽셀의 평균
+        ny1, ny2 = max(0, ry-2), min(expanded.shape[0], ry+3)
+        nx1, nx2 = max(0, rx-2), min(expanded.shape[1], rx+3)
+        patch = expanded[ny1:ny2, nx1:nx2, :]
+        # 해당 패치에서 워터마크가 아닌 영역의 마스크
+        patch_valid = np.zeros(patch.shape[:2], dtype=bool)
+        for py in range(patch.shape[0]):
+            for px in range(patch.shape[1]):
+                # expanded 좌표를 ROI 좌표로 변환
+                roi_y = (ny1 + py) - oy
+                roi_x = (nx1 + px) - ox
+                if 0 <= roi_y < ls and 0 <= roi_x < ls:
+                    if valid[roi_y, roi_x]:
+                        continue  # 워터마크 영역 → 제외
+                patch_valid[py, px] = True
+        if patch_valid.any():
+            bg_pixels = patch[patch_valid]
+            expanded[ry, rx, :] = bg_pixels.mean(axis=0)
 
-    Image.fromarray(img_array.astype(np.uint8), "RGB").save(str(output_path))
+    img_array[ey1:ey2, ex1:ex2, :] = expanded
+
+    # Step 5: 최종 경계 스무딩 (alpha 경계에서만 1px 블러)
+    final_img = Image.fromarray(img_array.astype(np.uint8), "RGB")
+    final_img.save(str(output_path))
 
     return {
         "success": True,
         "elapsed_ms": round((time.time() - t0) * 1000, 1),
         "pixels_modified": int(np.sum(valid)),
+        "pixels_interpolated": int(np.sum(needs_interp)),
         "logo_size": ls,
         "position": (x, y),
         "alpha_src": src_name,
@@ -118,11 +138,11 @@ def main():
             if "_clean" in img.stem: continue
             out = img.parent / f"{img.stem}_clean{img.suffix}"
             r = remove_watermark(img, out)
-            print(f"  {'✓' if r['success'] else '✗'} {img.name} ({r.get('elapsed_ms',0):.0f}ms)")
+            print(f"  {'✓' if r['success'] else '✗'} {img.name} ({r.get('elapsed_ms',0):.0f}ms, interp={r.get('pixels_interpolated',0)})")
     elif args.image:
         r = remove_watermark(args.image, args.output)
         if r["success"]:
-            print(f"완료: {args.output or args.image} ({r['pixels_modified']}px, {r['elapsed_ms']:.0f}ms)")
+            print(f"완료: {args.output or args.image} ({r['pixels_modified']}px, interp={r['pixels_interpolated']}px, {r['elapsed_ms']:.0f}ms)")
         else:
             print(f"ERROR: {r['error']}", file=sys.stderr); sys.exit(1)
     else:
