@@ -41,6 +41,15 @@ const IMAGE_WAIT_POLL_FAST = 500;
 const IMAGE_WAIT_POLL_SLOW = 1500;
 const MAX_IMAGES = 8;
 
+const IMG_SELECTORS = [
+  "img[alt*='AI generated']",
+  "img[alt*='Generated image']",
+  "img.image.loaded",
+  "img.image",
+  ".image-button img",
+  "model-response img",
+];
+
 const INPUT_SELECTORS = [
   "rich-textarea p",
   "[contenteditable='true']",
@@ -298,17 +307,9 @@ async function saveViaDownloadButton(
   const t = Date.now();
   try {
     let imgEl = null;
-    for (const sel of [
-      "img[alt*='AI generated']",
-      "img[alt*='Generated image']",
-      "img.image.loaded",
-      "img.image",
-      ".image-button img",
-      "model-response img",
-    ]) {
+    for (const sel of IMG_SELECTORS) {
       try {
         const els = await page.locator(sel).all();
-        // 큰 이미지만 필터 (아이콘/아바타 제외)
         const bigEls = [];
         for (const el of els) {
           try {
@@ -336,7 +337,6 @@ async function saveViaDownloadButton(
 
     // 다운로드 버튼을 여러 셀렉터로 탐색
     const DL_SELECTORS = [
-      "button[aria-label='Download full-sized image']",
       "button[aria-label*='Download']",
       "button[aria-label*='download']",
       "button[aria-label*='다운로드']",
@@ -364,7 +364,7 @@ async function saveViaDownloadButton(
       return false;
     }
 
-    const fullSrc: string | null = await page.evaluate(`() => {
+    const fullSrc: string | null = await page.evaluate(`(() => {
       const overlay = document.querySelector('.cdk-overlay-container');
       if (!overlay) return null;
       const imgs = overlay.querySelectorAll('img');
@@ -375,7 +375,7 @@ async function saveViaDownloadButton(
         if (w * h > bestArea) { bestArea = w * h; best = img.src; }
       }
       return best;
-    }`);
+    })()`);
 
     if (!fullSrc) {
       await page.keyboard.press("Escape");
@@ -483,14 +483,7 @@ async function saveImageFromSrc(
 
       // element screenshot fallback
       logDetail("canvas 실패 → element screenshot fallback");
-      for (const sel of [
-        "img[alt*='AI generated']",
-        "img[alt*='Generated image']",
-        "img.image.loaded",
-        "img.image",
-        ".image-button img",
-        "model-response img",
-      ]) {
+      for (const sel of IMG_SELECTORS) {
         try {
           const els = await page.locator(sel).all();
           if (index < els.length) {
@@ -702,9 +695,9 @@ async function generate(
 
     // overlay 닫기
     try {
-      await page.evaluate(`() => {
+      await page.evaluate(`(() => {
         document.querySelectorAll('.cdk-overlay-backdrop').forEach(el => el.click());
-      }`);
+      })()`);
       await sleep(300);
     } catch {}
 
@@ -796,7 +789,7 @@ async function main() {
   const prompt = positionals[0];
   if (!prompt) {
     console.error(
-      "Usage: npx tsx generate.ts <PROMPT> [--out DIR] [--count N] [--port N] [--dewatermark]"
+      "Usage: npx tsx generate.ts <PROMPT> [--out DIR] [--count N] [--port N] [--model fast|thinking|pro|auto] [--dewatermark]"
     );
     process.exit(1);
   }
