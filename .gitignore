@@ -1,1 +1,9 @@
 __pycache__/
+.gstack/
+tools/gwt.zip
+research/batch/*_exp.png
+research/batch/*_gwt.png
+research/batch/*_ours.png
+research/batch/*_clean.png
+results.tsv
+run.log

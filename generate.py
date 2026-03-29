@@ -64,14 +64,120 @@ def make_output_path(out_dir: str, index: int, ext: str = "png") -> Path:
     return out / f"gemini_{ts}_{index:02d}.{ext}"
 
 
+async def save_via_download_button(page, path: Path, index: int = 0) -> bool:
+    """Gemini UI의 다운로드 버튼을 클릭하여 표준 이미지 저장.
+    이미지 클릭 → 모달 → 'Download full-sized image' 버튼 클릭."""
+    t = time.time()
+    try:
+        # 이미지 요소 찾기
+        img_el = None
+        for sel in ("img[alt*='AI generated']", "img.image.loaded", "img.image"):
+            els = await page.locator(sel).all()
+            if index < len(els):
+                img_el = els[index]
+                break
+        if not img_el:
+            return False
+
+        # 이미지 클릭 → 모달 열기
+        await img_el.click()
+        await asyncio.sleep(1.0)
+
+        # 다운로드 버튼 찾기
+        dl_btn = page.locator("button[aria-label='Download full-sized image']").first
+        if not await dl_btn.is_visible(timeout=3000):
+            # 모달 닫기
+            await page.keyboard.press("Escape")
+            return False
+
+        # 모달 내 full-size 이미지 src 가져오기
+        full_src = await page.evaluate("""() => {
+            // 모달/오버레이 내의 큰 이미지 찾기
+            const overlay = document.querySelector('.cdk-overlay-container');
+            if (!overlay) return null;
+            const imgs = overlay.querySelectorAll('img');
+            let best = null, bestArea = 0;
+            for (const img of imgs) {
+                const w = img.naturalWidth || img.width;
+                const h = img.naturalHeight || img.height;
+                if (w * h > bestArea) {
+                    bestArea = w * h;
+                    best = img.src;
+                }
+            }
+            return best;
+        }""")
+
+        if not full_src:
+            await page.keyboard.press("Escape")
+            return False
+
+        # HTTP로 이미지 다운로드
+        if full_src.startswith("http"):
+            response = await page.context.request.get(full_src)
+            if response.ok:
+                body = await response.body()
+                path.write_bytes(body)
+            else:
+                await page.keyboard.press("Escape")
+                return False
+        elif full_src.startswith("blob:"):
+            # blob URL → canvas toDataURL
+            data = await page.evaluate("""(url) => {
+                return new Promise((resolve) => {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => {
+                        try {
+                            const c = document.createElement('canvas');
+                            c.width = img.naturalWidth || img.width;
+                            c.height = img.naturalHeight || img.height;
+                            c.getContext('2d').drawImage(img, 0, 0);
+                            resolve(c.toDataURL('image/png').split(',')[1] || null);
+                        } catch(e) { resolve(null); }
+                    };
+                    img.onerror = () => resolve(null);
+                    img.src = url;
+                });
+            }""", full_src)
+            if data:
+                path.write_bytes(base64.b64decode(data))
+            else:
+                await page.keyboard.press("Escape")
+                return False
+        else:
+            await page.keyboard.press("Escape")
+            return False
+
+        # 모달 닫기
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+        fsize = path.stat().st_size if path.exists() else 0
+        log_detail(f"다운로드 버튼 저장 ({time.time()-t:.1f}s, {fsize//1024}KB)")
+        return path.exists() and fsize > 1000
+
+    except Exception as e:
+        log_detail(f"다운로드 버튼 실패: {type(e).__name__}: {e}")
+        # 모달이 열려있으면 닫기
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+
+
 async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> bool:
-    """img src로부터 이미지를 저장. 3단계 fallback: canvas → element screenshot → http fetch"""
+    """img src로부터 이미지를 저장. fallback: canvas → element screenshot → http fetch"""
     t = time.time()
     src_preview = src[:80] + ("..." if len(src) > 80 else "")
 
     try:
         if src.startswith("blob:"):
-            # 1차: canvas toDataURL (가장 빠름, CORS taint 시 실패)
+            # canvas toDataURL
             data = await page.evaluate("""(url) => {
                 return new Promise((resolve) => {
                     const img = new Image();
@@ -91,11 +197,11 @@ async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> boo
             }""", src)
             if data:
                 path.write_bytes(base64.b64decode(data))
-                log_detail(f"canvas 저장 ({time.time()-t:.1f}s, {len(data)//1024}KB b64)")
+                log_detail(f"canvas fallback 저장 ({time.time()-t:.1f}s, {len(data)//1024}KB b64)")
                 return True
 
-            # 2차: element screenshot (canvas CORS taint 시 사용)
-            log_detail("canvas 실패 → element screenshot")
+            # element screenshot
+            log_detail("canvas 실패 → element screenshot fallback")
             for sel in ("img[alt*='AI generated']", "img.image.loaded", "img.image"):
                 try:
                     els = await page.locator(sel).all()
@@ -365,9 +471,18 @@ async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str
             except Exception:
                 pass
 
+            # overlay 닫기 (Gemini가 팝업/모달을 띄울 수 있음)
+            try:
+                await page.evaluate("""() => {
+                    document.querySelectorAll('.cdk-overlay-backdrop').forEach(el => el.click());
+                }""")
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
             # 프롬프트 입력
             log("→", "프롬프트 전송...")
-            await inp.click()
+            await inp.click(force=True)
             await inp.fill(prompt)
             await page.keyboard.press("Enter")
 
@@ -382,13 +497,16 @@ async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str
             if srcs:
                 log("✓", f"이미지 {len(srcs)}개 발견 ({gen_dur:.1f}s)")
                 for i, src in enumerate(srcs[:count]):
-                    ext = "png"
-                    if "jpeg" in src or "jpg" in src:
-                        ext = "jpg"
-                    elif "webp" in src:
-                        ext = "webp"
-                    out_path = make_output_path(out_dir, i, ext)
-                    ok = await save_image_from_src(page, src, out_path, index=i)
+                    out_path = make_output_path(out_dir, i, "png")
+
+                    # 1순위: Gemini 다운로드 버튼 (표준 파일)
+                    ok = await save_via_download_button(page, out_path, index=i)
+
+                    # 2순위: DOM에서 직접 추출 (fallback)
+                    if not ok:
+                        log_detail("다운로드 버튼 실패 → DOM 추출 fallback")
+                        ok = await save_image_from_src(page, src, out_path, index=i)
+
                     if ok:
                         fsize = out_path.stat().st_size
                         log("✓", f"저장: {out_path} ({fsize//1024}KB)")
@@ -406,7 +524,7 @@ async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str
             return saved_paths
 
         finally:
-            await browser.disconnect()
+            await browser.close()  # CDP attach 시 close()는 연결만 해제 (Chrome 프로세스 유지)
 
 
 # ─── CLI 진입점 ──────────────────────────────────────────────────────────────
@@ -420,6 +538,7 @@ def main():
     parser.add_argument("--count", type=int, default=1, help="저장할 이미지 수 (기본: 1, 최대: 8)")
     parser.add_argument("--port", type=int, default=9222, help="Chrome CDP 포트 (기본: 9222)")
     parser.add_argument("--timeout", type=int, default=90, help="이미지 대기 타임아웃 초 (기본: 90)")
+    parser.add_argument("--dewatermark", action="store_true", help="저장 후 Gemini 워터마크 자동 제거")
     args = parser.parse_args()
 
     if args.count < 1 or args.count > MAX_IMAGES:
@@ -441,6 +560,19 @@ def main():
         sys.exit(130)
 
     if paths:
+        # 워터마크 제거
+        if args.dewatermark:
+            try:
+                from dewatermark import remove_watermark
+                for p in paths:
+                    r = remove_watermark(p)
+                    if r["success"]:
+                        print(f"  워터마크 제거: {Path(p).name} ({r['elapsed_ms']:.0f}ms)")
+                    else:
+                        print(f"  워터마크 제거 실패: {r.get('error', 'unknown')}", file=sys.stderr)
+            except ImportError:
+                print("WARNING: dewatermark 모듈을 찾을 수 없습니다", file=sys.stderr)
+
         print(f"\n=== 생성 완료 ({len(paths)}장) ===")
         for p in paths:
             print(p)

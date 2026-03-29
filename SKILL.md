@@ -120,6 +120,26 @@ open "{저장된_경로}"
 
 ---
 
+## 선택적: 워터마크 자동 제거
+
+Gemini 이미지에는 오른쪽 하단에 반투명 별 모양 워터마크가 찍힙니다.
+`--dewatermark` 플래그로 저장 직후 자동 제거:
+
+```bash
+python3 "$SKILL_DIR/generate.py" "{PROMPT}" --out "{OUT_DIR}" --dewatermark
+```
+
+단독 사용 (이미 저장된 이미지):
+```bash
+python3 "$SKILL_DIR/dewatermark.py" image.png
+python3 "$SKILL_DIR/dewatermark.py" --dir ~/Desktop/images/
+```
+
+내부적으로 [GeminiWatermarkTool](https://github.com/allenk/GeminiWatermarkTool) v0.2.6을 사용합니다.
+바이너리는 `tools/GeminiWatermarkTool`에 포함되어 있습니다 (macOS Universal).
+
+---
+
 ## 선택적: 저장 디렉토리 커스텀
 
 사용자가 저장 위치를 지정하지 않으면 `~/Desktop`을 기본으로 사용.

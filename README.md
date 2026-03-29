@@ -47,15 +47,19 @@ python3 generate.py "a fox in snow, golden hour" --out ~/Desktop --count 1
 | `--count` | `1` | 저장할 이미지 수 (최대 8) |
 | `--port` | `9222` | Chrome CDP 포트 |
 | `--timeout` | `90` | 이미지 대기 타임아웃 (초) |
+| `--dewatermark` | off | 저장 후 Gemini 워터마크 자동 제거 |
 
 ## 파일 구조
 
 ```
 nanobanana-skill/
-├── SKILL.md          ← Claude Code 스킬 진입점
-├── generate.py       ← Playwright CDP 자동화 메인
-├── launch_chrome.sh  ← OS별 Chrome CDP 실행기
-└── requirements.txt  ← playwright
+├── SKILL.md              ← Claude Code 스킬 진입점
+├── generate.py           ← Playwright CDP 자동화 메인
+├── dewatermark.py        ← 워터마크 제거 (GWT wrapper)
+├── launch_chrome.sh      ← OS별 Chrome CDP 실행기
+├── requirements.txt      ← playwright
+└── tools/
+    └── GeminiWatermarkTool  ← 워터마크 제거 엔진 (macOS Universal)
 ```
 
 ## 이미지 저장 방식
