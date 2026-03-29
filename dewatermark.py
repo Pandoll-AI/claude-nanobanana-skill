@@ -104,12 +104,8 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
         )
     else:
         # 복잡한 배경: reverse alpha + feathered blending
-        # alpha를 블렌딩 가중치로 사용: 원본과 복원의 부드러운 전환
-        # alpha 높음 → 복원 결과 신뢰 / alpha 낮음(경계) → 원본에 가깝게
-        # 이렇게 하면 경계에서 visible edge가 안 생김
-        blend_w = np.clip(alpha_2d / 0.15, 0, 1)[:, :, np.newaxis]  # 0.15에서 100%
-        feathered = roi * (1.0 - blend_w) + restored * blend_w
-        img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, feathered, roi)
+        # reverse alpha 적용 + 경계 후처리
+        img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, restored, roi)
 
     # --- Pass 2: Clipping 아티팩트만 inpainting으로 수정 ---
     n_fix = int(np.sum(needs_fix))
