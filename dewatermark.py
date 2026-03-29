@@ -71,48 +71,62 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
 
     restored = np.clip(raw_restored, 0, 255)
 
-    # Step 3: 복원 가능 영역 먼저 적용
-    result = roi.copy()
-    valid_3d = valid[:, :, np.newaxis]
-    result = np.where(valid_3d, restored, result)
-
-    # Step 4: 복원 불가 영역은 주변 non-watermark 픽셀로 보간
-    # 확장 영역에서 주변 참조
+    # Step 3: 주변 배경 평균 추정 (ROI 외곽 ring에서)
     pad = 5
     ey1, ey2 = max(0, y-pad), min(height, y+ls+pad)
     ex1, ex2 = max(0, x-pad), min(width, x+ls+pad)
     expanded = img_array[ey1:ey2, ex1:ex2, :].copy()
     oy, ox = y - ey1, x - ex1
 
-    # 복원된 valid 영역을 expanded에 반영
-    expanded[oy:oy+ls, ox:ox+ls, :] = result
+    # 4변 외곽 strip에서 배경색 추정 (per-row/col 보간용)
+    # 상변 배경 (y-1 row)
+    bg_top = expanded[max(0,oy-1), ox:ox+ls, :] if oy > 0 else roi[0, :, :]
+    # 하변 배경 (y+ls row)
+    bg_bot_y = min(oy+ls, expanded.shape[0]-1)
+    bg_bot = expanded[bg_bot_y, ox:ox+ls, :] if oy+ls < expanded.shape[0] else roi[-1, :, :]
+    # 좌변 배경
+    bg_left = expanded[oy:oy+ls, max(0,ox-1), :] if ox > 0 else roi[:, 0, :]
+    # 우변 배경
+    bg_right_x = min(ox+ls, expanded.shape[1]-1)
+    bg_right = expanded[oy:oy+ls, bg_right_x, :] if ox+ls < expanded.shape[1] else roi[:, -1, :]
 
-    # needs_interp 픽셀들을 주변 평균으로 교체
-    interp_ys, interp_xs = np.where(needs_interp)
-    for dy, dx in zip(interp_ys, interp_xs):
-        ry, rx = oy + dy, ox + dx
-        # 5x5 이웃 중 valid가 아닌(= 원본 배경) 픽셀의 평균
-        ny1, ny2 = max(0, ry-2), min(expanded.shape[0], ry+3)
-        nx1, nx2 = max(0, rx-2), min(expanded.shape[1], rx+3)
-        patch = expanded[ny1:ny2, nx1:nx2, :]
-        # 해당 패치에서 워터마크가 아닌 영역의 마스크
-        patch_valid = np.zeros(patch.shape[:2], dtype=bool)
-        for py in range(patch.shape[0]):
-            for px in range(patch.shape[1]):
-                # expanded 좌표를 ROI 좌표로 변환
-                roi_y = (ny1 + py) - oy
-                roi_x = (nx1 + px) - ox
-                if 0 <= roi_y < ls and 0 <= roi_x < ls:
-                    if valid[roi_y, roi_x]:
-                        continue  # 워터마크 영역 → 제외
-                patch_valid[py, px] = True
-        if patch_valid.any():
-            bg_pixels = patch[patch_valid]
-            expanded[ry, rx, :] = bg_pixels.mean(axis=0)
+    # 각 픽셀의 "추정 배경" = 4변까지의 거리 역가중 평균
+    yy, xx = np.mgrid[0:ls, 0:ls]
+    d_top = (yy + 1).astype(np.float32)
+    d_bot = (ls - yy).astype(np.float32)
+    d_left = (xx + 1).astype(np.float32)
+    d_right = (ls - xx).astype(np.float32)
 
-    img_array[ey1:ey2, ex1:ex2, :] = expanded
+    w_top = 1.0 / d_top
+    w_bot = 1.0 / d_bot
+    w_left = 1.0 / d_left
+    w_right = 1.0 / d_right
+    w_sum = w_top + w_bot + w_left + w_right
 
-    # Step 5: 최종 경계 스무딩 (alpha 경계에서만 1px 블러)
+    bg_estimate = (
+        w_top[:,:,np.newaxis] * bg_top[np.newaxis,:,:] +
+        w_bot[:,:,np.newaxis] * bg_bot[np.newaxis,:,:] +
+        w_left[:,:,np.newaxis] * bg_left[:,np.newaxis,:] +
+        w_right[:,:,np.newaxis] * bg_right[:,np.newaxis,:]
+    ) / w_sum[:,:,np.newaxis]
+
+    # Step 4: alpha-proportional 블렌딩
+    # alpha 낮음(경계) → reverse alpha 신뢰 → weight_ra 높음
+    # alpha 높음(중심) → 배경 추정 사용 → weight_bg 높음
+    alpha_2d = alpha_map[:ls, :ls]
+    # 블렌딩 계수: alpha^2로 비선형화 (경계 근처에서 reverse alpha 더 신뢰)
+    blend_factor = (alpha_2d ** 2)[:, :, np.newaxis]
+
+    blended = restored * (1.0 - blend_factor) + bg_estimate * blend_factor
+
+    # needs_interp 영역은 100% 배경 추정 사용
+    needs_interp_3d = needs_interp[:, :, np.newaxis]
+    blended = np.where(needs_interp_3d, bg_estimate, blended)
+
+    # valid 영역만 적용
+    valid_3d = valid[:, :, np.newaxis]
+    img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, blended, roi)
+
     final_img = Image.fromarray(img_array.astype(np.uint8), "RGB")
     final_img.save(str(output_path))
 
