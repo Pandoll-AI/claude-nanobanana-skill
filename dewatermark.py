@@ -69,6 +69,32 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
 
     img_array[y:y+ls, x:x+ls, :] = np.where(valid[:, :, np.newaxis], restored, roi)
 
+    # Stage 2: 잔상 보정 — 복원된 영역 중 주변과 차이가 큰 픽셀을 주변 평균으로 교체
+    pad = 4
+    ey1, ey2 = max(0, y-pad), min(height, y+ls+pad)
+    ex1, ex2 = max(0, x-pad), min(width, x+ls+pad)
+    region = img_array[ey1:ey2, ex1:ex2, :].copy()
+    oy, ox = y - ey1, x - ex1
+
+    # 각 valid 픽셀에 대해 3x3 주변 평균과의 차이가 크면 주변 평균으로 블렌딩
+    for dy in range(ls):
+        for dx in range(ls):
+            if not valid[dy, dx]:
+                continue
+            ry, rx = oy + dy, ox + dx
+            # 3x3 이웃 평균 (자기 자신 제외)
+            ny1, ny2 = max(0, ry-1), min(region.shape[0], ry+2)
+            nx1, nx2 = max(0, rx-1), min(region.shape[1], rx+2)
+            neighbors = region[ny1:ny2, nx1:nx2, :].reshape(-1, 3)
+            me = region[ry, rx, :]
+            avg = (neighbors.sum(axis=0) - me) / max(len(neighbors) - 1, 1)
+            diff = np.abs(me - avg).mean()
+            if diff > 30:  # 주변과 크게 다르면 보정
+                blend = 0.6
+                region[ry, rx, :] = me * (1-blend) + avg * blend
+
+    img_array[ey1:ey2, ex1:ex2, :] = region
+
     Image.fromarray(img_array.astype(np.uint8), "RGB").save(str(output_path))
 
     return {
