@@ -193,6 +193,8 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
         # 외곽 ring2 (그 안쪽): 70% RA + 30% 배경
         ring2 = eroded1 & ~eroded2
 
+        # 이웃 참조를 위해 현재 상태 스냅샷 (in-place 수정 시 순서 의존성 방지)
+        snapshot = img_array.copy()
         for ring_mask, ra_weight in [(ring1, 0.3), (ring2, 0.7)]:
             ring_ys, ring_xs = np.where(ring_mask)
             for ry, rx in zip(ring_ys, ring_xs):
@@ -205,9 +207,9 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
                         ny, nx = ry + dy, rx + dx
                         if 0 <= ny < ls and 0 <= nx < ls:
                             if not valid[ny, nx]:
-                                neighbors.append(img_array[y+ny, x+nx, :])
+                                neighbors.append(snapshot[y+ny, x+nx, :])
                         elif 0 <= ay+dy < height and 0 <= ax+dx < width:
-                            neighbors.append(img_array[ay+dy, ax+dx, :])
+                            neighbors.append(snapshot[ay+dy, ax+dx, :])
                 if neighbors:
                     bg_mean = np.mean(neighbors, axis=0)
                     img_array[ay, ax, :] = img_array[ay, ax, :] * ra_weight + bg_mean * (1 - ra_weight)

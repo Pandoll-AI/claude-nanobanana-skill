@@ -170,8 +170,8 @@ async def save_via_download_button(page, path: Path, index: int = 0) -> bool:
         return False
 
 
-async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> bool:
-    """img src로부터 이미지를 저장. fallback: canvas → element screenshot → http fetch"""
+async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> Path | None:
+    """img src로부터 이미지를 저장. 성공 시 실제 저장 경로 반환, 실패 시 None."""
     t = time.time()
     src_preview = src[:80] + ("..." if len(src) > 80 else "")
 
@@ -198,7 +198,7 @@ async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> boo
             if data:
                 path.write_bytes(base64.b64decode(data))
                 log_detail(f"canvas fallback 저장 ({time.time()-t:.1f}s, {len(data)//1024}KB b64)")
-                return True
+                return path
 
             # element screenshot
             log_detail("canvas 실패 → element screenshot fallback")
@@ -210,11 +210,11 @@ async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> boo
                         if shot:
                             path.write_bytes(shot)
                             log_detail(f"element screenshot 저장 ({time.time()-t:.1f}s, {len(shot)//1024}KB)")
-                            return True
+                            return path
                 except Exception:
                     continue
             log_err(f"blob 저장 실패: canvas + screenshot 모두 실패 ({src_preview})")
-            return False
+            return None
 
         elif src.startswith("data:image/"):
             parts = src.split(",", 1)
@@ -225,9 +225,9 @@ async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> boo
             ext_match = re.search(r"image/(\w+)", header)
             ext = ext_match.group(1) if ext_match else "png"
             path = path.with_suffix(f".{ext}")
-            path.write_bytes(base64.b64decode(encoded + "=="))
+            path.write_bytes(base64.b64decode(encoded + "=" * (-len(encoded) % 4)))
             log_detail(f"data URL 저장 ({time.time()-t:.1f}s)")
-            return True
+            return path
 
         elif src.startswith("http"):
             response = await page.context.request.get(src)
@@ -235,17 +235,17 @@ async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> boo
                 body = await response.body()
                 path.write_bytes(body)
                 log_detail(f"HTTP 다운로드 ({time.time()-t:.1f}s, {len(body)//1024}KB)")
-                return True
+                return path
             log_err(f"HTTP 다운로드 실패: status={response.status} ({src_preview})")
-            return False
+            return None
 
         else:
             log_err(f"알 수 없는 URL scheme: {src_preview}")
-            return False
+            return None
 
     except Exception as e:
         log_err(f"저장 중 예외: {type(e).__name__}: {e}")
-    return False
+    return None
 
 
 # ─── 메인 로직 ──────────────────────────────────────────────────────────────
@@ -505,9 +505,12 @@ async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str
                     # 2순위: DOM에서 직접 추출 (fallback)
                     if not ok:
                         log_detail("다운로드 버튼 실패 → DOM 추출 fallback")
-                        ok = await save_image_from_src(page, src, out_path, index=i)
+                        actual_path = await save_image_from_src(page, src, out_path, index=i)
+                        ok = actual_path is not None
+                        if actual_path:
+                            out_path = actual_path
 
-                    if ok:
+                    if ok and out_path.exists():
                         fsize = out_path.stat().st_size
                         log("✓", f"저장: {out_path} ({fsize//1024}KB)")
                         saved_paths.append(str(out_path))
