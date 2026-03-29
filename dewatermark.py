@@ -63,34 +63,56 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
     alpha_3d = alpha_2d[:, :, np.newaxis]
     valid = alpha_2d > ALPHA_THRESHOLD
 
-    # --- Pass 1: Reverse Alpha Blending (모든 valid 픽셀) ---
+    # --- 배경 균일성 판별 ---
+    # ROI 외곽 1px ring에서 배경 std 체크
+    pad = 3
+    ey1, ey2 = max(0, y-pad), min(height, y+ls+pad)
+    ex1, ex2 = max(0, x-pad), min(width, x+ls+pad)
+    oy, ox = y - ey1, x - ex1
+    expanded = img_array[ey1:ey2, ex1:ex2, :].copy()
+
+    bg_samples = []
+    if oy > 0:
+        bg_samples.append(expanded[oy-1, ox:ox+ls, :])
+    if oy+ls < expanded.shape[0]:
+        bg_samples.append(expanded[oy+ls, ox:ox+ls, :])
+    if ox > 0:
+        bg_samples.append(expanded[oy:oy+ls, ox-1, :])
+    if ox+ls < expanded.shape[1]:
+        bg_samples.append(expanded[oy:oy+ls, ox+ls, :])
+    bg_all = np.concatenate(bg_samples, axis=0) if bg_samples else roi.reshape(-1, 3)
+    bg_std = np.std(bg_all, axis=0).mean()
+
+    # --- Pass 1: Reverse Alpha Blending ---
     alpha_clamped = np.clip(alpha_3d, 0, 0.99)
     raw_restored = (roi - alpha_clamped * LOGO_VALUE) / (1.0 - alpha_clamped)
 
-    # Clipping이 필요한 픽셀 감지 (= reverse alpha가 실패한 영역)
+    # Clipping이 필요한 픽셀 감지
     needs_fix = ((raw_restored < -5).any(axis=2) | (raw_restored > 260).any(axis=2)) & valid
 
     restored = np.clip(raw_restored, 0, 255)
 
-    # Pass 1 결과를 이미지에 적용
     valid_3d = valid[:, :, np.newaxis]
-    img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, restored, roi)
+
+    if bg_std < 5.0:
+        # 균일 배경: 외곽 평균색으로 flat fill (alpha 캘리브레이션 오차 방지)
+        flat_bg = np.mean(bg_all, axis=0).reshape(1, 1, 3)
+        img_array[y:y+ls, x:x+ls, :] = np.where(
+            valid_3d,
+            np.broadcast_to(flat_bg, (ls, ls, 3)).astype(np.float32),
+            roi
+        )
+    else:
+        # 복잡한 배경: reverse alpha 적용
+        img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, restored, roi)
 
     # --- Pass 2: Clipping 아티팩트만 inpainting으로 수정 ---
     n_fix = int(np.sum(needs_fix))
-    if n_fix > 0:
-        # needs_fix 영역만 마스크로 inpainting
+    if n_fix > 0 and bg_std >= 5.0:
+        # 균일 배경은 flat fill로 이미 처리됨
         fix_mask = needs_fix.astype(np.uint8) * 255
-
-        # dilate로 마스크 약간 확장 (아티팩트 주변도 포함)
         kernel = np.ones((3, 3), np.uint8)
         fix_mask = cv2.dilate(fix_mask, kernel, iterations=1)
-
-        # 확장 영역에서 inpainting
-        pad = 6
-        ey1, ey2 = max(0, y-pad), min(height, y+ls+pad)
-        ex1, ex2 = max(0, x-pad), min(width, x+ls+pad)
-        oy, ox = y - ey1, x - ex1
 
         expanded_bgr = cv2.cvtColor(
             img_array[ey1:ey2, ex1:ex2, :].astype(np.uint8),
@@ -103,7 +125,6 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
         inpainted_bgr = cv2.inpaint(expanded_bgr, expanded_mask, 3, cv2.INPAINT_TELEA)
         inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
 
-        # inpainting 결과를 원본에 적용 (마스크 영역만)
         img_array[ey1:ey2, ex1:ex2, :] = np.where(
             expanded_mask[:, :, np.newaxis] > 0,
             inpainted_rgb,
