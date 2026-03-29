@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2.0 (2026-03-29)
+
+### Breaking Changes
+- **Python → TypeScript 전환** — 전체 스킬이 TypeScript로 재작성됨
+- `python3 generate.py` → `npx tsx generate.ts`
+- `pip install` → `npm install`
+- `requirements.txt` 제거, `package.json` 추가
+
+### Features
+- **서버사이드 dewatermark API** — 알고리즘이 `geminiwatermarkfree.vercel.app`에서 실행
+  - `POST /api/dewatermark` — 워터마크 감지 + 제거 (감지 못하면 원본 반환)
+  - `POST /api/detect` — 워터마크 감지만 (confidence score 포함)
+- **워터마크 자동 감지** — NCC score 기반으로 워터마크 유무 판별 (threshold: 0.3)
+- **알고리즘 보호** — dewatermark 로직이 서버에만 존재, 스킬은 thin API client만 포함
+- **OpenCV 제거** — 순수 TypeScript로 bilateral filter, Sobel, inpainting 등 구현
+  - sharp (libvips) 만 사용하여 Vercel 서버리스 50MB 제한 내 배포
+
+### Architecture
+```
+packages/
+├── api/              ← Vercel 서버리스 (geminiwatermarkfree.vercel.app)
+│   ├── api/          ← /api/dewatermark, /api/detect 엔드포인트
+│   ├── lib/          ← dewatermark-core, ncc, bilateral, inpaint 등
+│   └── assets/       ← alpha map PNGs (서버에만 존재)
+└── skill/            ← Claude Code 스킬
+    ├── generate.ts   ← Playwright JS CDP 자동화
+    └── dewatermark-client.ts ← API 호출 클라이언트
+```
+
+### Performance
+- API 처리 시간: **108ms** (1024x559 이미지, Vercel serverless)
+- Python 원본 대비 PSNR: **74.7 dB** (사실상 동일한 결과, 최대 1px 차이)
+
+---
+
 ## v0.1.0 (2026-03-29)
 
 ### Features

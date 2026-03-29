@@ -1,9 +1,20 @@
 __pycache__/
+node_modules/
+package-lock.json
 .gstack/
-tools/gwt.zip
-research/batch/*_exp.png
-research/batch/*_gwt.png
-research/batch/*_ours.png
-research/batch/*_clean.png
+.vercel/
+.env*
+
+# v0.1.0 Python algorithm + research (algorithm protection)
+*.py
+assets/
+research/
+RESEARCH.md
+
+# legacy artifacts
+tools/
 results.tsv
 run.log
+
+# API algorithm source (lives in geminiwatermarkfree repo only)
+packages/api/

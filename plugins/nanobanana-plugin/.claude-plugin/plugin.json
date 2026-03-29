@@ -1,0 +1,5 @@
+{
+  "name": "nanobanana-plugin",
+  "description": "Gemini 웹에서 이미지 생성 + 워터마크 자동 제거",
+  "version": "0.2.0"
+}
