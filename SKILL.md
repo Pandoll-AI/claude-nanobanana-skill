@@ -77,7 +77,8 @@ python3 "$SKILL_DIR/generate.py" \
   "{PROMPT}" \
   --out "{OUT_DIR}" \
   --count {COUNT} \
-  --port 9222
+  --port 9222 \
+  --timeout 90
 ```
 
 변수:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gemini Web Image Generator
+Gemini Web Image Generator (nanobanana-skill)
 CDP 모드 Chrome에 attach해서 gemini.google.com에서 이미지를 자동 생성·저장합니다.
 
 Usage:
@@ -10,34 +10,24 @@ Usage:
 import argparse
 import asyncio
 import base64
-import json
-import os
 import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 try:
     from playwright.async_api import async_playwright
 except ImportError:
     print("ERROR: playwright가 설치되지 않았습니다.", file=sys.stderr)
-    print("설치: pip install playwright && python -m playwright install chromium", file=sys.stderr)
+    print("  pip install playwright && python -m playwright install chromium", file=sys.stderr)
     sys.exit(1)
 
 # ─── 상수 ──────────────────────────────────────────────────────────────────
 GEMINI_URL = "https://gemini.google.com/app"
 DEFAULT_TIMEOUT = 90_000   # ms
-IMAGE_WAIT_POLL = 1_000     # ms
+IMAGE_WAIT_POLL_FAST = 500  # ms — 이미지 감지 전 빠른 폴링
+IMAGE_WAIT_POLL_SLOW = 1500 # ms — 이미지 감지 후 안정화 대기
 MAX_IMAGES = 8
-
-# Gemini 이미지 응답을 식별하는 URL 패턴들
-IMAGE_URL_PATTERNS = [
-    r"https://.*\.googleusercontent\.com/.*",
-    r"https://lh\d+\.google(usercontent)?\.com/.*",
-    r"https://.*\.ggpht\.com/.*",
-    r"data:image/",
-]
 
 # 텍스트 입력창 셀렉터 (우선순위 순)
 INPUT_SELECTORS = [
@@ -47,28 +37,22 @@ INPUT_SELECTORS = [
     "div[role='textbox']",
 ]
 
-# 이미지 생성 완료를 나타내는 DOM 셀렉터 (우선순위 순)
-IMAGE_DONE_SELECTORS = [
-    "img[alt*='AI generated']",       # Gemini 2025+ 실제 확인된 alt 속성
-    "img.image.loaded",               # class="image animate loaded"
-    "img.image.animate.loaded",
-    "model-response img[src^='blob']",
-    "model-response img[src^='https']",
-    "img[data-request-id]",
-    ".image-generation-container img",
-    "model-response img[src*='googleusercontent']",
-    "message-content img[src*='lh']",
-]
+_t0 = time.time()
 
-# 에러 메시지 패턴 (생성 실패 감지)
-ERROR_PATTERNS = [
-    "I can't help with that",
-    "I'm not able to generate",
-    "couldn't create",
-    "content policy",
-    "이미지를 생성할 수 없",
-    "생성할 수 없습니다",
-]
+
+# ─── 로깅 ──────────────────────────────────────────────────────────────────
+
+def _elapsed() -> str:
+    return f"{time.time() - _t0:.1f}s"
+
+def log(icon: str, msg: str):
+    print(f"[{_elapsed():>6}] {icon} {msg}")
+
+def log_err(msg: str):
+    print(f"[{_elapsed():>6}] ✗ {msg}", file=sys.stderr)
+
+def log_detail(msg: str):
+    print(f"[{_elapsed():>6}]   {msg}", file=sys.stderr)
 
 
 # ─── 유틸 ──────────────────────────────────────────────────────────────────
@@ -80,152 +64,178 @@ def make_output_path(out_dir: str, index: int, ext: str = "png") -> Path:
     return out / f"gemini_{ts}_{index:02d}.{ext}"
 
 
-async def blob_url_to_bytes(page, blob_url: str) -> bytes | None:
-    """blob: URL을 canvas에 draw → toDataURL로 base64 추출"""
-    try:
-        result = await page.evaluate("""(url) => {
-            return new Promise((resolve) => {
-                const img = new Image();
-                img.crossOrigin = 'anonymous';
-                img.onload = () => {
-                    try {
-                        const canvas = document.createElement('canvas');
-                        canvas.width = img.naturalWidth || img.width;
-                        canvas.height = img.naturalHeight || img.height;
-                        const ctx = canvas.getContext('2d');
-                        ctx.drawImage(img, 0, 0);
-                        const dataUrl = canvas.toDataURL('image/png');
-                        resolve(dataUrl.split(',')[1] || null);
-                    } catch(e) {
-                        resolve(null);
-                    }
-                };
-                img.onerror = () => resolve(null);
-                img.src = url;
-            });
-        }""", blob_url)
-        if result:
-            return base64.b64decode(result)
-    except Exception:
-        pass
-    return None
-
-
-async def element_screenshot_to_bytes(page, selector: str) -> bytes | None:
-    """이미지 엘리먼트를 Playwright element screenshot으로 캡처"""
-    try:
-        el = page.locator(selector).first
-        return await el.screenshot()
-    except Exception:
-        pass
-    return None
-
-
 async def save_image_from_src(page, src: str, path: Path, index: int = 0) -> bool:
-    """img src로부터 이미지를 저장 (blob/data/http 모두 처리)"""
+    """img src로부터 이미지를 저장. 3단계 fallback: canvas → element screenshot → http fetch"""
+    t = time.time()
+    src_preview = src[:80] + ("..." if len(src) > 80 else "")
+
     try:
         if src.startswith("blob:"):
-            # 1차: canvas toDataURL
-            data = await blob_url_to_bytes(page, src)
+            # 1차: canvas toDataURL (가장 빠름, CORS taint 시 실패)
+            data = await page.evaluate("""(url) => {
+                return new Promise((resolve) => {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => {
+                        try {
+                            const c = document.createElement('canvas');
+                            c.width = img.naturalWidth || img.width;
+                            c.height = img.naturalHeight || img.height;
+                            c.getContext('2d').drawImage(img, 0, 0);
+                            resolve(c.toDataURL('image/png').split(',')[1] || null);
+                        } catch(e) { resolve(null); }
+                    };
+                    img.onerror = () => resolve(null);
+                    img.src = url;
+                });
+            }""", src)
             if data:
-                path.write_bytes(data)
+                path.write_bytes(base64.b64decode(data))
+                log_detail(f"canvas 저장 ({time.time()-t:.1f}s, {len(data)//1024}KB b64)")
                 return True
-            # 2차: element screenshot (index 기반으로 셀렉터 특정)
-            print("  [save] canvas 방식 실패, element screenshot 시도...", file=sys.stderr)
-            sel_list = ["img[alt*='AI generated']", "img.image.loaded", "img.image"]
-            for sel in sel_list:
+
+            # 2차: element screenshot (canvas CORS taint 시 사용)
+            log_detail("canvas 실패 → element screenshot")
+            for sel in ("img[alt*='AI generated']", "img.image.loaded", "img.image"):
                 try:
                     els = await page.locator(sel).all()
                     if index < len(els):
                         shot = await els[index].screenshot()
                         if shot:
                             path.write_bytes(shot)
+                            log_detail(f"element screenshot 저장 ({time.time()-t:.1f}s, {len(shot)//1024}KB)")
                             return True
                 except Exception:
                     continue
+            log_err(f"blob 저장 실패: canvas + screenshot 모두 실패 ({src_preview})")
             return False
+
         elif src.startswith("data:image/"):
-            # data URL: "data:image/png;base64,xxxxx"
             parts = src.split(",", 1)
             if len(parts) != 2:
+                log_err(f"잘못된 data URL 형식 (쉼표 없음)")
                 return False
             header, encoded = parts
             ext_match = re.search(r"image/(\w+)", header)
             ext = ext_match.group(1) if ext_match else "png"
             path = path.with_suffix(f".{ext}")
-            path.write_bytes(base64.b64decode(encoded + "=="))  # padding 허용
+            path.write_bytes(base64.b64decode(encoded + "=="))
+            log_detail(f"data URL 저장 ({time.time()-t:.1f}s)")
             return True
+
         elif src.startswith("http"):
-            # CDN URL: Playwright로 직접 fetch
             response = await page.context.request.get(src)
             if response.ok:
-                path.write_bytes(await response.body())
+                body = await response.body()
+                path.write_bytes(body)
+                log_detail(f"HTTP 다운로드 ({time.time()-t:.1f}s, {len(body)//1024}KB)")
                 return True
+            log_err(f"HTTP 다운로드 실패: status={response.status} ({src_preview})")
+            return False
+
+        else:
+            log_err(f"알 수 없는 URL scheme: {src_preview}")
+            return False
+
     except Exception as e:
-        print(f"  [save] {type(e).__name__}: {e}", file=sys.stderr)
+        log_err(f"저장 중 예외: {type(e).__name__}: {e}")
     return False
 
 
 # ─── 메인 로직 ──────────────────────────────────────────────────────────────
 
 async def find_input(page):
-    """사용 가능한 텍스트 입력창 찾기"""
+    """사용 가능한 텍스트 입력창 찾기 (500ms 타임아웃으로 빠르게 탐색)"""
     for sel in INPUT_SELECTORS:
         try:
             loc = page.locator(sel).first
-            if await loc.is_visible(timeout=2000):
+            if await loc.is_visible(timeout=500):
+                return loc
+        except Exception:
+            continue
+    # 빠른 탐색 실패 시 한 번 더 여유 있게
+    for sel in INPUT_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=3000):
                 return loc
         except Exception:
             continue
     return None
 
 
-async def check_error_message(page) -> str | None:
-    """Gemini가 이미지 생성을 거부했는지 확인"""
-    try:
-        body_text = await page.evaluate("() => document.body.innerText")
-        for pat in ERROR_PATTERNS:
-            if pat.lower() in body_text.lower():
-                return pat
-    except Exception:
-        pass
-    return None
+# 이미지 탐색 + 에러 감지를 한 번의 JS evaluate로 수행 (네트워크 왕복 1회)
+_POLL_JS = """() => {
+    // 이미지 수집
+    const selectors = [
+        "img[alt*='AI generated']",
+        "img.image.loaded",
+        "img.image",
+        "model-response img",
+    ];
+    const seen = new Set();
+    const images = [];
+    for (const sel of selectors) {
+        for (const img of document.querySelectorAll(sel)) {
+            const src = img.src || '';
+            if (src && !seen.has(src) && img.width > 50) {
+                seen.add(src);
+                images.push(src);
+            }
+        }
+    }
+
+    // 에러 감지 (최근 응답 영역만 검사 — body 전체보다 빠름)
+    let error = null;
+    const lastResp = document.querySelector('model-response:last-of-type');
+    const text = (lastResp || document.body).innerText || '';
+    const patterns = [
+        "I can't help with that", "I'm not able to generate",
+        "couldn't create", "content policy",
+        "이미지를 생성할 수 없", "생성할 수 없습니다",
+        "safety", "unable to fulfill"
+    ];
+    const lower = text.toLowerCase();
+    for (const p of patterns) {
+        if (lower.includes(p.toLowerCase())) { error = p; break; }
+    }
+
+    // 로딩 상태 감지
+    const loading = document.querySelectorAll(
+        '.loading-indicator, [class*=spinner], mat-progress-bar, .thinking-indicator'
+    ).length > 0;
+
+    return { images, error, loading };
+}"""
 
 
 async def wait_for_images(page, timeout_ms: int) -> list[str]:
     """이미지 생성 완료를 기다리고 img src 목록을 반환"""
     deadline = time.time() + timeout_ms / 1000
-    stable_count = 0      # 연속으로 같은 수를 관찰한 횟수
+    stable_count = 0
     last_srcs: list[str] = []
+    poll_count = 0
 
     while time.time() < deadline:
-        # 에러 메시지 먼저 체크
-        err = await check_error_message(page)
-        if err:
-            print(f"ERROR: Gemini가 거부했습니다: {err}", file=sys.stderr)
+        poll_count += 1
+        remaining = int(deadline - time.time())
+
+        try:
+            result = await page.evaluate(_POLL_JS)
+        except Exception as e:
+            log_detail(f"폴링 오류 (무시): {type(e).__name__}")
+            await asyncio.sleep(0.5)
+            continue
+
+        # 에러 감지
+        if result.get("error"):
+            err = result["error"]
+            log_err(f"Gemini 거부: \"{err}\"")
+            log_err("  → 프롬프트를 수정하거나 덜 구체적인 표현으로 재시도하세요")
             return []
 
-        # JS로 한 번에 모든 후보 img를 수집 (셀렉터 우선순위 순)
-        found = await page.evaluate("""() => {
-            const selectors = [
-                "img[alt*='AI generated']",
-                "img.image.loaded",
-                "img.image",
-                "model-response img",
-            ];
-            const seen = new Set();
-            const results = [];
-            for (const sel of selectors) {
-                for (const img of document.querySelectorAll(sel)) {
-                    const src = img.src || '';
-                    if (src && !seen.has(src) && img.width > 50) {
-                        seen.add(src);
-                        results.push(src);
-                    }
-                }
-            }
-            return results;
-        }""")
+        found = result.get("images", [])
+        loading = result.get("loading", False)
 
         if found:
             if found == last_srcs:
@@ -233,18 +243,27 @@ async def wait_for_images(page, timeout_ms: int) -> list[str]:
             else:
                 stable_count = 0
                 last_srcs = found
-                print(f"  [wait] 이미지 {len(found)}개 감지, 안정화 대기...", file=sys.stderr)
+                log_detail(f"이미지 {len(found)}개 감지, 안정화 확인 중... (남은 시간 {remaining}s)")
 
-            # 2회 연속 동일한 목록이면 완료로 판단
             if stable_count >= 2:
                 return last_srcs
+            # 이미지 발견 후에는 느린 폴링
+            await asyncio.sleep(IMAGE_WAIT_POLL_SLOW / 1000)
         else:
             stable_count = 0
-            # DOM 깜빡임으로 일시적으로 비어도 기존 목록 유지
+            # 진행 상황 표시 (10초마다)
+            if poll_count % 20 == 0:
+                status = "생성 중..." if loading else "대기 중..."
+                log_detail(f"{status} (남은 시간 {remaining}s)")
+            # 이미지 미발견 시 빠른 폴링
+            await asyncio.sleep(IMAGE_WAIT_POLL_FAST / 1000)
 
-        await asyncio.sleep(IMAGE_WAIT_POLL / 1000)
-
-    # 타임아웃 전 마지막으로 발견된 것 반환
+    if last_srcs:
+        log_detail(f"타임아웃이지만 {len(last_srcs)}개 이미지 발견됨 — 반환합니다")
+    else:
+        log_err(f"이미지 감지 타임아웃 ({timeout_ms//1000}s)")
+        log_err("  → 네트워크가 느리면 다시 시도하세요")
+        log_err("  → Gemini가 텍스트만 응답했을 수 있습니다 (이미지 프롬프트인지 확인)")
     return last_srcs
 
 
@@ -255,13 +274,20 @@ async def screenshot_fallback(page, out_dir: str, count: int) -> list[Path]:
         p = make_output_path(out_dir, i, "png")
         await page.screenshot(path=str(p), full_page=False)
         paths.append(p)
-        print(f"[fallback] 스크린샷 저장: {p}", file=sys.stderr)
+        log_err(f"스크린샷 fallback 저장: {p}")
+        log_err("  → 이미지 DOM 셀렉터가 변경됐을 수 있습니다. 브라우저에서 직접 확인하세요.")
     return paths
 
 
 async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str]:
     """메인 이미지 생성 함수. 저장된 파일 경로 목록을 반환.
-    실패 시 RuntimeError를 raise합니다 (sys.exit 대신)."""
+    실패 시 RuntimeError를 raise합니다."""
+
+    global _t0
+    _t0 = time.time()
+
+    log("◆", f"nanobanana-skill 시작 (port={port}, count={count})")
+    log("◆", f"프롬프트: {prompt!r}")
 
     async with async_playwright() as pw:
         # CDP 모드로 기존 Chrome에 attach
@@ -269,15 +295,21 @@ async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str
             browser = await pw.chromium.connect_over_cdp(f"http://localhost:{port}")
         except Exception as e:
             raise RuntimeError(
-                f"Chrome CDP 연결 실패 (port {port}): {e}\n"
-                "launch_chrome.sh를 먼저 실행하고 로그인을 완료하세요."
+                f"Chrome CDP 연결 실패 (port {port})\n"
+                f"  원인: {e}\n"
+                f"  조치: launch_chrome.sh를 먼저 실행하세요\n"
+                f"        bash ~/.claude/skills/nanobanana-skill/launch_chrome.sh"
             )
 
+        log("✓", f"CDP 연결 성공")
+
         try:
-            # 기존 컨텍스트/탭 사용
             contexts = browser.contexts
             if not contexts:
-                raise RuntimeError("Chrome에 열린 탭이 없습니다.")
+                raise RuntimeError(
+                    "Chrome에 열린 탭이 없습니다.\n"
+                    "  조치: Chrome 창에서 아무 페이지나 열어주세요"
+                )
 
             ctx = contexts[0]
             pages = ctx.pages
@@ -289,49 +321,66 @@ async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str
                     page = p
                     break
 
-            # Gemini 탭 없으면 새 탭
             if page is None:
+                log("→", "Gemini 탭 없음, 새 탭 열기...")
                 page = await ctx.new_page()
 
             # Gemini 앱 페이지인지 확인
             if "gemini.google.com/app" not in page.url:
-                await page.goto(GEMINI_URL, wait_until="networkidle")
+                log("→", "Gemini 페이지로 이동 중...")
+                await page.goto(GEMINI_URL, wait_until="domcontentloaded")
+                # networkidle 대신 domcontentloaded + 짧은 대기 (더 빠름)
+                await asyncio.sleep(1)
 
             # 로그인 상태 확인
             if "accounts.google.com" in page.url or "signin" in page.url.lower():
-                raise RuntimeError("로그인이 필요합니다. Chrome에서 Gemini에 로그인 후 재실행하세요.")
+                raise RuntimeError(
+                    "Google 로그인이 필요합니다.\n"
+                    "  조치: Chrome 창에서 gemini.google.com에 로그인 후 재실행\n"
+                    f"  현재 URL: {page.url}"
+                )
 
-            print(f"[✓] Gemini 페이지 확인: {page.url}")
+            log("✓", f"Gemini 페이지 확인")
 
             # 입력창 찾기
             inp = await find_input(page)
             if inp is None:
-                raise RuntimeError("텍스트 입력창을 찾을 수 없습니다. Gemini 페이지가 완전히 로드됐는지 확인하세요.")
+                raise RuntimeError(
+                    "텍스트 입력창을 찾을 수 없습니다.\n"
+                    "  원인: Gemini 페이지가 아직 로딩 중이거나 UI 구조가 변경됨\n"
+                    "  조치: 브라우저에서 페이지를 새로고침하고 재시도\n"
+                    f"  현재 URL: {page.url}"
+                )
 
-            # 이전 대화 내용으로 인한 오염 방지 — 새 대화 시작 시도
+            # 새 대화 시작 (이전 대화의 이미지와 혼동 방지)
             try:
-                new_chat_btn = page.locator("a[href='/app'], button[aria-label*='New chat'], button[aria-label*='새 대화']").first
-                if await new_chat_btn.is_visible(timeout=2000):
+                new_chat_btn = page.locator(
+                    "a[href='/app'], button[aria-label*='New chat'], button[aria-label*='새 대화']"
+                ).first
+                if await new_chat_btn.is_visible(timeout=800):
                     await new_chat_btn.click()
-                    await page.wait_for_load_state("networkidle", timeout=5000)
+                    await asyncio.sleep(1)  # networkidle 대신 간단 대기
                     inp = await find_input(page)
+                    log("✓", "새 대화 시작")
             except Exception:
                 pass
 
-            # 프롬프트 입력 (fill로 직접 삽입 — keyboard.type 개행 주입 방지)
-            print(f"[→] 프롬프트 전송: {prompt!r}")
+            # 프롬프트 입력
+            log("→", "프롬프트 전송...")
             await inp.click()
             await inp.fill(prompt)
             await page.keyboard.press("Enter")
 
             # 이미지 생성 대기
-            print(f"[…] 이미지 생성 대기 중 (최대 {DEFAULT_TIMEOUT//1000}초)")
+            log("…", f"이미지 생성 대기 (최대 {DEFAULT_TIMEOUT//1000}초)")
+            gen_start = time.time()
             srcs = await wait_for_images(page, DEFAULT_TIMEOUT)
+            gen_dur = time.time() - gen_start
 
             saved_paths = []
 
             if srcs:
-                print(f"[✓] 이미지 {len(srcs)}개 발견")
+                log("✓", f"이미지 {len(srcs)}개 발견 ({gen_dur:.1f}s)")
                 for i, src in enumerate(srcs[:count]):
                     ext = "png"
                     if "jpeg" in src or "jpg" in src:
@@ -341,19 +390,22 @@ async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str
                     out_path = make_output_path(out_dir, i, ext)
                     ok = await save_image_from_src(page, src, out_path, index=i)
                     if ok:
-                        print(f"[✓] 저장 완료: {out_path}")
+                        fsize = out_path.stat().st_size
+                        log("✓", f"저장: {out_path} ({fsize//1024}KB)")
                         saved_paths.append(str(out_path))
                     else:
-                        print(f"[!] 저장 실패 (src={src[:60]}...)", file=sys.stderr)
+                        log_err(f"저장 실패 (이미지 {i+1}/{count})")
             else:
-                print("[!] 이미지를 찾지 못했습니다. 스크린샷 fallback 실행...", file=sys.stderr)
+                log_err("이미지를 찾지 못했습니다")
+                log_err("  스크린샷 fallback으로 현재 화면을 캡처합니다")
                 fb = await screenshot_fallback(page, out_dir, 1)
                 saved_paths = [str(p) for p in fb]
 
+            total = time.time() - _t0
+            log("◆", f"완료 (총 {total:.1f}s)")
             return saved_paths
 
         finally:
-            # CDP attach한 브라우저는 disconnect (close하면 Chrome이 종료됨)
             await browser.disconnect()
 
 
@@ -361,31 +413,41 @@ async def generate(prompt: str, out_dir: str, count: int, port: int) -> list[str
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Gemini 웹에서 이미지를 생성하고 저장합니다."
+        description="nanobanana-skill: Gemini 웹에서 이미지를 생성하고 저장합니다."
     )
     parser.add_argument("prompt", help="이미지 생성 프롬프트")
     parser.add_argument("--out", default="~/Desktop", help="저장 디렉토리 (기본: ~/Desktop)")
-    parser.add_argument("--count", type=int, default=1, help="저장할 이미지 수 (기본: 1)")
+    parser.add_argument("--count", type=int, default=1, help="저장할 이미지 수 (기본: 1, 최대: 8)")
     parser.add_argument("--port", type=int, default=9222, help="Chrome CDP 포트 (기본: 9222)")
+    parser.add_argument("--timeout", type=int, default=90, help="이미지 대기 타임아웃 초 (기본: 90)")
     args = parser.parse_args()
 
     if args.count < 1 or args.count > MAX_IMAGES:
         print(f"ERROR: --count는 1~{MAX_IMAGES} 사이여야 합니다.", file=sys.stderr)
         sys.exit(1)
 
+    global DEFAULT_TIMEOUT
+    DEFAULT_TIMEOUT = args.timeout * 1000
+
     try:
         paths = asyncio.run(generate(args.prompt, args.out, args.count, args.port))
     except RuntimeError as e:
+        print(f"\n{'='*50}", file=sys.stderr)
         print(f"ERROR: {e}", file=sys.stderr)
+        print(f"{'='*50}", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n중단됨 (Ctrl+C)", file=sys.stderr)
+        sys.exit(130)
 
     if paths:
-        print("\n=== 생성 완료 ===")
+        print(f"\n=== 생성 완료 ({len(paths)}장) ===")
         for p in paths:
             print(p)
         sys.exit(0)
     else:
         print("ERROR: 이미지를 저장하지 못했습니다.", file=sys.stderr)
+        print("  → 브라우저에서 Gemini 페이지를 확인하세요", file=sys.stderr)
         sys.exit(1)
 
 
