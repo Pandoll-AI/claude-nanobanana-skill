@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Gemini 이미지 워터마크 제거 — 2-pass 하이브리드.
-Pass 1: Reverse alpha blending (모든 valid 픽셀)
-Pass 2: Clipping 아티팩트만 OpenCV inpainting으로 수정
+Gemini 이미지 워터마크 제거.
+
+알고리즘 (Allen Kuo의 GeminiWatermarkTool에서 영감):
+1. Reverse alpha blending으로 워터마크 제거
+2. Alpha map의 Sobel gradient → 경계 마스크 생성
+3. 경계 영역을 Non-local Means denoising + Poisson blending으로 후처리
 """
 
 import sys, time
@@ -28,6 +31,30 @@ def _get_alpha_map(name: str) -> np.ndarray:
     if name not in _ALPHA_MAPS:
         _ALPHA_MAPS[name] = _load_alpha_map(name)
     return _ALPHA_MAPS[name]
+
+
+def _build_gradient_mask(alpha_2d: np.ndarray, strength: float = 1.2) -> np.ndarray:
+    """Alpha map의 Sobel gradient → soft edge mask.
+    Allen Kuo 접근법: gradient가 큰 곳 = 별 모양 경계 = 아티팩트 발생 지점."""
+    # Sobel gradient
+    alpha_u8 = (alpha_2d * 255).astype(np.uint8)
+    gx = cv2.Sobel(alpha_u8, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(alpha_u8, cv2.CV_64F, 0, 1, ksize=3)
+    grad = np.sqrt(gx**2 + gy**2)
+
+    # Normalize + sqrt (edge zone 확장)
+    if grad.max() > 0:
+        grad = grad / grad.max()
+    grad = np.sqrt(grad) * strength
+    grad = np.clip(grad, 0, 1)
+
+    # Dilate + Gaussian blur (feathering)
+    grad_u8 = (grad * 255).astype(np.uint8)
+    kernel = np.ones((3, 3), np.uint8)
+    grad_u8 = cv2.dilate(grad_u8, kernel, iterations=2)
+    grad_smooth = cv2.GaussianBlur(grad_u8, (5, 5), 1.5).astype(np.float32) / 255.0
+
+    return grad_smooth
 
 
 def remove_watermark(image_path: str | Path, output_path: str | Path | None = None) -> dict:
@@ -63,74 +90,59 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
     alpha_3d = alpha_2d[:, :, np.newaxis]
     valid = alpha_2d > ALPHA_THRESHOLD
 
-    # --- 배경 균일성 판별 ---
-    # ROI 외곽 1px ring에서 배경 std 체크
-    pad = 3
-    ey1, ey2 = max(0, y-pad), min(height, y+ls+pad)
-    ex1, ex2 = max(0, x-pad), min(width, x+ls+pad)
-    oy, ox = y - ey1, x - ex1
-    expanded = img_array[ey1:ey2, ex1:ex2, :].copy()
-
-    bg_samples = []
-    if oy > 0:
-        bg_samples.append(expanded[oy-1, ox:ox+ls, :])
-    if oy+ls < expanded.shape[0]:
-        bg_samples.append(expanded[oy+ls, ox:ox+ls, :])
-    if ox > 0:
-        bg_samples.append(expanded[oy:oy+ls, ox-1, :])
-    if ox+ls < expanded.shape[1]:
-        bg_samples.append(expanded[oy:oy+ls, ox+ls, :])
-    bg_all = np.concatenate(bg_samples, axis=0) if bg_samples else roi.reshape(-1, 3)
-    bg_std = np.std(bg_all, axis=0).mean()
-
-    # --- Pass 1: Reverse Alpha Blending ---
+    # --- Step 1: Reverse Alpha Blending ---
     alpha_clamped = np.clip(alpha_3d, 0, 0.99)
     raw_restored = (roi - alpha_clamped * LOGO_VALUE) / (1.0 - alpha_clamped)
-
-    # Clipping이 필요한 픽셀 감지
-    needs_fix = ((raw_restored < -5).any(axis=2) | (raw_restored > 260).any(axis=2)) & valid
-
     restored = np.clip(raw_restored, 0, 255)
 
+    # valid 영역만 적용
     valid_3d = valid[:, :, np.newaxis]
+    ra_result = np.where(valid_3d, restored, roi)
 
-    if bg_std < 5.0:
-        # 균일 배경: 외곽 평균색으로 flat fill
-        flat_bg = np.mean(bg_all, axis=0).reshape(1, 1, 3)
-        img_array[y:y+ls, x:x+ls, :] = np.where(
-            valid_3d,
-            np.broadcast_to(flat_bg, (ls, ls, 3)).astype(np.float32),
-            roi
-        )
+    # --- Step 2: Gradient mask 생성 ---
+    grad_mask = _build_gradient_mask(alpha_2d, strength=1.2)
+    grad_mask_3d = grad_mask[:, :, np.newaxis]
+
+    # --- Step 3: 후처리 (denoising) ---
+    # Non-local Means denoising: reverse alpha 결과의 노이즈/아티팩트 제거
+    ra_u8 = np.clip(ra_result, 0, 255).astype(np.uint8)
+    denoised = cv2.fastNlMeansDenoisingColored(ra_u8, None, 10, 10, 7, 21)
+    denoised_f = denoised.astype(np.float32)
+
+    # --- Step 4: Gradient-masked soft blending ---
+    # 내부(grad_mask ≈ 0): reverse alpha 결과 그대로 (수학적 정확)
+    # 경계(grad_mask ≈ 1): denoised 결과 (아티팩트 제거)
+    blended_roi = ra_result * (1.0 - grad_mask_3d) + denoised_f * grad_mask_3d
+
+    # --- Step 5: Poisson blending으로 경계 연속성 ---
+    # ROI를 원본 이미지에 자연스럽게 합성
+    img_u8 = img_array.astype(np.uint8).copy()
+    src_patch = np.clip(blended_roi, 0, 255).astype(np.uint8)
+
+    # seamlessClone용 마스크 (valid 영역)
+    clone_mask = (valid.astype(np.uint8) * 255)
+    # 마스크를 약간 축소 (경계 1px은 blending에 사용)
+    kernel = np.ones((3, 3), np.uint8)
+    clone_mask = cv2.erode(clone_mask, kernel, iterations=1)
+
+    if clone_mask.sum() > 0:
+        # BGR 변환
+        dst_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
+        src_bgr = cv2.cvtColor(src_patch, cv2.COLOR_RGB2BGR)
+
+        # center 좌표
+        cx = x + ls // 2
+        cy = y + ls // 2
+
+        try:
+            result_bgr = cv2.seamlessClone(src_bgr, dst_bgr, clone_mask, (cx, cy), cv2.MIXED_CLONE)
+            result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+            img_array = result_rgb.astype(np.float32)
+        except cv2.error:
+            # seamlessClone 실패 시 직접 적용
+            img_array[y:y+ls, x:x+ls, :] = blended_roi
     else:
-        # 복잡한 배경: reverse alpha + feathered blending
-        # reverse alpha 적용 + 경계 후처리
-        img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, restored, roi)
-
-    # --- Pass 2: Clipping 아티팩트만 inpainting으로 수정 ---
-    n_fix = int(np.sum(needs_fix))
-    if n_fix > 0 and bg_std >= 5.0:
-        # 균일 배경은 flat fill로 이미 처리됨
-        fix_mask = needs_fix.astype(np.uint8) * 255
-        kernel = np.ones((3, 3), np.uint8)
-        fix_mask = cv2.dilate(fix_mask, kernel, iterations=1)
-
-        expanded_bgr = cv2.cvtColor(
-            img_array[ey1:ey2, ex1:ex2, :].astype(np.uint8),
-            cv2.COLOR_RGB2BGR
-        )
-
-        expanded_mask = np.zeros(expanded_bgr.shape[:2], dtype=np.uint8)
-        expanded_mask[oy:oy+ls, ox:ox+ls] = fix_mask
-
-        inpainted_bgr = cv2.inpaint(expanded_bgr, expanded_mask, 3, cv2.INPAINT_TELEA)
-        inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
-
-        img_array[ey1:ey2, ex1:ex2, :] = np.where(
-            expanded_mask[:, :, np.newaxis] > 0,
-            inpainted_rgb,
-            img_array[ey1:ey2, ex1:ex2, :]
-        )
+        img_array[y:y+ls, x:x+ls, :] = blended_roi
 
     Image.fromarray(img_array.astype(np.uint8), "RGB").save(str(output_path))
 
@@ -138,7 +150,6 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
         "success": True,
         "elapsed_ms": round((time.time() - t0) * 1000, 1),
         "pixels_modified": int(np.sum(valid)),
-        "pixels_inpainted": n_fix,
         "logo_size": ls,
         "position": (x, y),
         "alpha_src": src_name,
@@ -156,11 +167,11 @@ def main():
             if "_clean" in img.stem or "_exp" in img.stem: continue
             out = img.parent / f"{img.stem}_clean{img.suffix}"
             r = remove_watermark(img, out)
-            print(f"  {'✓' if r['success'] else '✗'} {img.name} ({r.get('elapsed_ms',0):.0f}ms, fix={r.get('pixels_inpainted',0)})")
+            print(f"  {'✓' if r['success'] else '✗'} {img.name} ({r.get('elapsed_ms',0):.0f}ms)")
     elif args.image:
         r = remove_watermark(args.image, args.output)
         if r["success"]:
-            print(f"완료: {args.output or args.image} ({r['pixels_modified']}px, fix={r['pixels_inpainted']}px, {r['elapsed_ms']:.0f}ms)")
+            print(f"완료: {args.output or args.image} ({r['pixels_modified']}px, {r['elapsed_ms']:.0f}ms)")
         else:
             print(f"ERROR: {r['error']}", file=sys.stderr); sys.exit(1)
     else:
