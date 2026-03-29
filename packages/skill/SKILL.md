@@ -9,7 +9,7 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# Gemini Web Image Generator v0.2.0
+# Gemini Web Image Generator v0.2.1
 
 ## 개요
 
@@ -80,7 +80,7 @@ npx tsx "$SKILL_DIR/generate.ts" \
   --out "{OUT_DIR}" \
   --count {COUNT} \
   --port 9222 \
-  --timeout 90
+  --timeout 180
 ```
 
 변수:

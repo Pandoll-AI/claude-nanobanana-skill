@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 /**
- * Gemini Web Image Generator (nanobanana-skill v0.2.0)
+ * Gemini Web Image Generator (nanobanana-skill v0.2.1)
  * CDP 모드 Chrome에 attach해서 gemini.google.com에서 이미지를 자동 생성·저장합니다.
  *
  * Usage:
@@ -15,7 +15,7 @@ import { dewatermark } from "./dewatermark-client.js";
 
 // ─── 상수 ──────────────────────────────────────────────────────────────────
 const GEMINI_URL = "https://gemini.google.com/app";
-let DEFAULT_TIMEOUT = 90_000;
+let DEFAULT_TIMEOUT = 180_000;
 const IMAGE_WAIT_POLL_FAST = 500;
 const IMAGE_WAIT_POLL_SLOW = 1500;
 const MAX_IMAGES = 8;
@@ -135,22 +135,53 @@ async function saveViaDownloadButton(
       "img.image.loaded",
       "img.image",
     ]) {
-      const els = await page.locator(sel).all();
-      if (index < els.length) {
-        imgEl = els[index];
-        break;
+      try {
+        const els = await page.locator(sel).all();
+        if (index < els.length) {
+          imgEl = els[index];
+          break;
+        }
+      } catch {
+        continue;
       }
     }
     if (!imgEl) return false;
 
-    await imgEl.click();
-    await sleep(1000);
+    try {
+      await imgEl.click({ timeout: 3000 });
+    } catch {
+      logDetail("이미지 클릭 실패 — 다운로드 버튼 방식 스킵");
+      return false;
+    }
+    await sleep(1500);
 
-    const dlBtn = page
-      .locator("button[aria-label='Download full-sized image']")
-      .first();
-    if (!(await dlBtn.isVisible({ timeout: 3000 }))) {
-      await page.keyboard.press("Escape");
+    // 다운로드 버튼을 여러 셀렉터로 탐색
+    const DL_SELECTORS = [
+      "button[aria-label='Download full-sized image']",
+      "button[aria-label*='Download']",
+      "button[aria-label*='download']",
+      "button[aria-label*='다운로드']",
+      "button[data-tooltip*='Download']",
+      "button[data-tooltip*='다운로드']",
+      "[role='button'][aria-label*='ownload']",
+    ];
+
+    let dlBtn = null;
+    for (const sel of DL_SELECTORS) {
+      try {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible({ timeout: 1000 })) {
+          dlBtn = loc;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (!dlBtn) {
+      logDetail("다운로드 버튼을 찾을 수 없음");
+      try { await page.keyboard.press("Escape"); } catch {}
       return false;
     }
 
@@ -350,6 +381,12 @@ async function waitForImages(
       continue;
     }
 
+    if (!result) {
+      logDetail("폴링 결과 없음 (무시)");
+      await sleep(500);
+      continue;
+    }
+
     if (result.error) {
       logErr(`Gemini 거부: "${result.error}"`);
       logErr("  → 프롬프트를 수정하거나 덜 구체적인 표현으로 재시도하세요");
@@ -400,7 +437,7 @@ async function generate(
 ): Promise<string[]> {
   _t0 = Date.now();
 
-  log("◆", `nanobanana-skill v0.2.0 시작 (port=${port}, count=${count})`);
+  log("◆", `nanobanana-skill v0.2.1 시작 (port=${port}, count=${count})`);
   log("◆", `프롬프트: "${prompt}"`);
 
   const browser = await chromium
@@ -433,17 +470,26 @@ async function generate(
     if (!page.url().includes("gemini.google.com/app")) {
       log("→", "Gemini 페이지로 이동 중...");
       await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded" });
-      await sleep(1000);
+      await sleep(3000);
     }
 
-    if (
-      page.url().includes("accounts.google.com") ||
-      page.url().toLowerCase().includes("signin")
-    ) {
-      throw new Error(
-        "Google 로그인이 필요합니다.\n" +
-          "  조치: Chrome 창에서 gemini.google.com에 로그인 후 재실행"
-      );
+    // 로그인 리다이렉트 감지 (최대 5초 추가 대기)
+    for (let i = 0; i < 5; i++) {
+      const currentUrl = page.url();
+      if (
+        !currentUrl.includes("accounts.google.com") &&
+        !currentUrl.toLowerCase().includes("signin")
+      ) {
+        break;
+      }
+      if (i === 4) {
+        throw new Error(
+          "Google 로그인이 필요합니다.\n" +
+            "  조치: Chrome 창에서 gemini.google.com에 로그인 후 재실행"
+        );
+      }
+      logDetail(`로그인 페이지 감지, 대기 중... (${i + 1}/5)`);
+      await sleep(2000);
     }
 
     log("✓", "Gemini 페이지 확인");
@@ -551,7 +597,7 @@ async function main() {
       out: { type: "string", default: "~/Desktop" },
       count: { type: "string", default: "1" },
       port: { type: "string", default: "9222" },
-      timeout: { type: "string", default: "90" },
+      timeout: { type: "string", default: "180" },
       dewatermark: { type: "boolean", default: false },
     },
     allowPositionals: true,
