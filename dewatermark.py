@@ -136,6 +136,33 @@ def remove_watermark(image_path: str | Path, output_path: str | Path | None = No
     valid_3d = valid[:, :, np.newaxis]
     img_array[y:y+ls, x:x+ls, :] = np.where(valid_3d, blended, roi)
 
+    # Step 5: 경계 1px 스무딩 — 처리 영역과 원본의 전환점에서 평균
+    final_roi = img_array[y:y+ls, x:x+ls, :].copy()
+    orig_roi = roi.copy()  # 원본 워터마크 포함 ROI
+
+    # 상변: final_roi[0,:] = avg(img_array[y-1,:], final_roi[1,:])
+    if y > 0:
+        outer = img_array[y-1, x:x+ls, :]
+        inner = final_roi[1, :, :] if ls > 1 else final_roi[0, :, :]
+        final_roi[0, :, :] = (outer + inner) / 2.0
+    # 하변
+    if y + ls < height:
+        outer = img_array[y+ls, x:x+ls, :]
+        inner = final_roi[-2, :, :] if ls > 1 else final_roi[-1, :, :]
+        final_roi[-1, :, :] = (outer + inner) / 2.0
+    # 좌변
+    if x > 0:
+        outer = img_array[y:y+ls, x-1, :]
+        inner = final_roi[:, 1, :] if ls > 1 else final_roi[:, 0, :]
+        final_roi[:, 0, :] = (outer + inner) / 2.0
+    # 우변
+    if x + ls < width:
+        outer = img_array[y:y+ls, x+ls, :]
+        inner = final_roi[:, -2, :] if ls > 1 else final_roi[:, -1, :]
+        final_roi[:, -1, :] = (outer + inner) / 2.0
+
+    img_array[y:y+ls, x:x+ls, :] = final_roi
+
     final_img = Image.fromarray(img_array.astype(np.uint8), "RGB")
     final_img.save(str(output_path))
 
